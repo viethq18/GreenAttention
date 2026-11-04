@@ -47,6 +47,12 @@ from green_attention import dispatch, jit
 
 TILE_N = 128
 SPLIT_TILE_TOKENS = 256  # grid upper bound: at most one split per 256 tokens of context
+# Windowed instances: a sequence spans at most ceil((W + max_q) / 128) + 1 KV tiles, so an unsplit CTA is
+# one short pass and the split path's fixed cost (plan_quota in every CTA of the wider grid, fp32 partials,
+# the combine launch) pays only while the unsplit grid (batch * units CTAs) leaves most SMs idle.
+# H100, Gemma sliding (16 kv heads, W 1023), p25 us unsplit vs best split: batch*units 16: 26 vs 18,
+# 32: 27 vs 22, 48: 27.5 vs 26.4; 64: 27.6 vs 30.2, 128: 39 vs 45, 256: 66 vs 76 (eff 1 at cap >= 2).
+WINDOW_SPLIT_MAX_FILL = 0.4
 # (head_dim, GQA) -> max_q (= min(64 / GQA, 16)). kv_heads is runtime (k_cache.shape[2]);
 # head_dim 512 runs as DSPLIT = 2 CTAs per kv head.
 INSTANCES = {
@@ -114,12 +120,15 @@ def _prewarm(backend) -> None:
         ensure_ready()
 
 
-def plan_splits(batch: int, max_ctx: int, sm_count: int = 132, units: int = 4) -> int:
+def plan_splits(batch: int, max_ctx: int, sm_count: int = 132, units: int = 4, windowed: bool = False) -> int:
     """Grid upper bound: clamp(ceil(2*SMs / (batch*units)), 1, ceil(ctx/256)).
 
     ``units`` = kv_heads * DSPLIT (CTAs per sequence in grid.y). The device planner may use fewer
     splits; the bound only has to be stable across graph capture/replay and keep the workspace sane.
+    ``windowed``: 1 once ``batch * units`` exceeds ``WINDOW_SPLIT_MAX_FILL`` of the SMs.
     """
+    if windowed and batch * units > WINDOW_SPLIT_MAX_FILL * sm_count:
+        return 1
     want = -(-2 * sm_count // (batch * units))
     cap = max(-(-max_ctx // SPLIT_TILE_TOKENS), 1)
     return max(min(want, cap), 1)
@@ -243,7 +252,7 @@ def select(kw: dict) -> Union[Callable, str]:
         # A windowed row sees at most W keys below its own position; + mq + one tile for alignment.
         max_ctx = min(max_ctx, wl + mq + TILE_N)
     units = kvh * (2 if hd == 512 else 1)
-    splits = plan_splits(batch, max_ctx, _S.sm_count[q.device.index], units)
+    splits = plan_splits(batch, max_ctx, _S.sm_count[q.device.index], units, windowed=wl >= 0)
     if splits > 1 and batch * units * splits > MAX_SPLIT_CTAS:
         return "split workspace too small"
     return lambda **call_kw: _run(splits, page, window_left=wl, kvh=kvh, units=units, **call_kw)

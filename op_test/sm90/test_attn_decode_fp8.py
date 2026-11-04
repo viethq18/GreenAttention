@@ -442,13 +442,13 @@ def test_gemma_swa_window_qlen_row_bounds():
     check(make_case(lens, [2, 5, 16], 16, seed=62, inst=GEMMA_SWA))
 
 
-@pytest.mark.parametrize("batch", [1, 2, 5])
+@pytest.mark.parametrize("batch", [1, 2, 3])
 @pytest.mark.parametrize("qlen", [1, 4])
 def test_gemma_swa_split_kv(batch, qlen):
     # context far beyond the window: split planning must count only the ~9 window tiles
     lens = [20000 - 777 * i for i in range(batch)]
     kw = make_case(lens, [qlen] * batch, 16, seed=71 + batch, inst=GEMMA_SWA, extra_pages=8)
-    assert attn_decode.plan_splits(batch, kw["page_table"].shape[1] * 16, units=16) > 1
+    assert attn_decode.plan_splits(batch, kw["page_table"].shape[1] * 16, units=16, windowed=True) > 1
     check(kw)
 
 

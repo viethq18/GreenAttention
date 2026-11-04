@@ -140,7 +140,7 @@ def main():
                     kw_a.update(q=kw["q"].to(torch.bfloat16), k_cache=kw["k_cache"].to(torch.bfloat16) * 0.5,
                                 v_cache=kw["v_cache"].to(torch.bfloat16) * 0.5)
                 units = KVH * (2 if HD == 512 else 1)
-                splits = attn_decode.plan_splits(bs, ctx, attn_decode._S.sm_count[0], units)
+                splits = attn_decode.plan_splits(bs, ctx, attn_decode._S.sm_count[0], units, windowed=window is not None)
                 fa4(**kw_a)
                 green(**kw)
                 torch.cuda.synchronize()

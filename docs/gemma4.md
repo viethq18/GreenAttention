@@ -54,6 +54,12 @@ but only honoured by `WINDOW = true` instances (see the invariant below).
 `units = kv_heads * DSPLIT` and the window-capped context. The workspace stays at
 `2*132 + 4*66` CTAs x 64 rows x 256 dims. The bound `batch * units * ceil(264 / (batch * units)) < 264 + batch * units`
 holds for all three instances whenever splits > 1.
+- **Windowed instance: no split once the grid is 40 % full.** `plan_splits(..., windowed=True)` returns 1 when
+  `batch * units > 0.4 * SMs` (sliding: batch >= 4 on H100). A window caps a sequence at about 9 KV tiles, so an
+  unsplit CTA is one short pass, while a grid cap > 1 costs `plan_quota` in every CTA of the wider grid plus the
+  combine even when the device then picks 1 split (bs 8: cap 1 39 us, cap 3 with eff 1 49 us). H100, L2 flushed,
+  median of ABBA x3, ctx 1024 / 8192, q 1 / 4: bs 4 31.6 -> 28.2 us, bs 8 50.4 -> 39.5 us (FA4 fp8 48),
+  bs 16 78.1 -> 66.6 us (FA4 75); bs <= 3 keeps splitting (bs 1: 26 us unsplit vs 18.8 split); Qwen unchanged.
 
 **Precision.** This is unchanged from the Qwen instance: e4m3 Q/K/V, fp32 accumulation, and P quantized to
 e4m3 (x256) per 64-column half. `softmax_scale = 1.0` for Gemma (q/k RMS-normed); the kernel takes it
