@@ -70,3 +70,18 @@ def test_decline_logs_once_per_signature(dispatch, caplog):
     lines = [r.getMessage() for r in caplog.records if "fallback" in r.getMessage()]
     assert len(lines) == 2
     assert "q.dtype=torch.bfloat16" in lines[0] and "q.dtype=torch.float16" in lines[1]
+
+
+def test_declined_decode_casts_bf16_query_for_fp8_fallback(dispatch):
+    # GreenAttentionBackend leaves the decode query in bf16; FA4 needs it in the KV dtype.
+    d = dispatch()
+    d.register("decode", lambda kw: "declined")
+    seen = {}
+    wrapped = d.with_kvcache(lambda **kw: seen.setdefault("q", kw["q"]))
+    kc = torch.zeros(1, 16, 4, 256, dtype=torch.float8_e4m3fn)
+    q = torch.full((2, 24, 256), 1.5, dtype=torch.bfloat16)
+    wrapped(q=q, k_cache=kc, max_seqlen_q=1)
+    assert seen["q"].dtype == torch.float8_e4m3fn and seen["q"].float().eq(1.5).all()
+    seen.clear()
+    wrapped(q=q, k_cache=kc.to(torch.bfloat16), max_seqlen_q=1)  # bf16 KV: query untouched
+    assert seen["q"] is q

@@ -127,6 +127,9 @@ def with_kvcache(fallback: Callable) -> Callable:
                 run = select(op, kwargs)
                 if run is not None:
                     return run(**kwargs)
+        q, kc = kwargs.get("q"), kwargs.get("k_cache")
+        if q is not None and kc is not None and kc.dtype == torch.float8_e4m3fn and q.dtype != kc.dtype:
+            kwargs["q"] = q.to(kc.dtype)  # GreenAttentionBackend left the decode query in bf16
         return fallback(*args, **kwargs)
 
     return flash_attn_with_kvcache
