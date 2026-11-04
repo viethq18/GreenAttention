@@ -18,6 +18,7 @@ import torch
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import LinearAttnKernelBase
 
 from green_attention import dispatch
+from green_attention import gdn_recurrent  # noqa: F401  (registers gdn kernels + replayssm hook)
 
 logger = logging.getLogger(__name__)
 
