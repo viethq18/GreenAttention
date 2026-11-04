@@ -85,3 +85,22 @@ def test_declined_decode_casts_bf16_query_for_fp8_fallback(dispatch):
     seen.clear()
     wrapped(q=q, k_cache=kc.to(torch.bfloat16), max_seqlen_q=1)  # bf16 KV: query untouched
     assert seen["q"] is q
+
+
+@pytest.mark.parametrize("disable", ["", "extend"])
+def test_wide_fp8_prefill_routes_to_extend_then_dequant(dispatch, monkeypatch, disable):
+    # A prefill over an FP8 cache FA4 cannot attend natively is the "extend" op; declined or disabled it
+    # takes the dequantizing fallback, never FA4 directly.
+    from green_attention import wide_kv
+
+    d = dispatch(disable)
+    monkeypatch.setattr(wide_kv, "applies", lambda kc: kc is not None and kc.shape[-1] > 256)
+    monkeypatch.setattr(wide_kv, "attend", lambda fallback, kw, op: f"dequant:{op}")
+    d.register("extend", lambda kw: lambda **_: "extend")
+    wrapped = d.with_kvcache(_fallback)
+    wide = torch.zeros(1, 16, 4, 512, dtype=torch.float8_e4m3fn)
+    want = "dequant:extend" if disable else "extend"
+    for mq in (d.MAX_VERIFY_Q + 1, None):
+        assert wrapped(q=torch.zeros(2, 32, 512), k_cache=wide, max_seqlen_q=mq) == want
+    narrow = torch.zeros(1, 16, 4, 256, dtype=torch.float8_e4m3fn)  # FA4 runs it natively: never "extend"
+    assert wrapped(q=torch.zeros(2, 24, 256), k_cache=narrow, max_seqlen_q=d.MAX_VERIFY_Q + 1) == "fallback"

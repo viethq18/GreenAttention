@@ -1,15 +1,17 @@
 """Route each attention op to a green kernel or to the stock fallback.
 
 Ops: ``decode`` / ``verify`` (full-attention ``flash_attn_with_kvcache`` with
-``max_seqlen_q == 1`` / ``2..MAX_VERIFY_Q``) and ``gdn_decode`` / ``gdn_verify``
-(the GDN recurrent kernels). A kernel module registers a *selector* per op: it
+``max_seqlen_q == 1`` / ``2..MAX_VERIFY_Q``), ``extend`` (any other
+``flash_attn_with_kvcache`` call over an FP8 cache FA4 cannot run natively, see
+``wide_kv.applies``) and ``gdn_decode`` / ``gdn_verify`` (the GDN recurrent
+kernels). A kernel module registers a *selector* per op: it
 receives the call's keyword arguments and returns the callable to run, or a
 string saying why it declines. Selection depends only on shapes, dtypes and
 Python scalars, never on tensor data, so it is stable across CUDA graph capture
 and replay.
 
-``GREEN_ATTN_DISABLE=decode,verify,gdn_decode,gdn_verify`` (any subset) forces
-the fallback for those ops: the A/B switch. Every declined call logs once per
+``GREEN_ATTN_DISABLE=decode,verify,extend,gdn_decode,gdn_verify`` (any subset)
+forces the fallback for those ops: the A/B switch. Every declined call logs once per
 signature (op, reasons, argument dtypes/shapes without the batch dimension).
 """
 
@@ -26,7 +28,7 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-OPS = ("decode", "verify", "gdn_decode", "gdn_verify")
+OPS = ("decode", "verify", "extend", "gdn_decode", "gdn_verify")
 MAX_VERIFY_Q = 16
 
 Selector = Callable[[dict], Union[Callable, str]]
@@ -115,11 +117,15 @@ def kvcache_op(max_seqlen_q: Any) -> Optional[str]:
 
 
 def with_kvcache(fallback: Callable) -> Callable:
-    """Wrap FA4's ``flash_attn_with_kvcache`` so decode/verify calls can go green."""
+    """Wrap FA4's ``flash_attn_with_kvcache`` so decode/verify (and extend over a wide FP8 cache) can go green."""
+    from green_attention import wide_kv
 
     @functools.wraps(fallback)
     def flash_attn_with_kvcache(*args, **kwargs):
         op = kvcache_op(kwargs.get("max_seqlen_q"))
+        wide = not args and wide_kv.applies(kwargs.get("k_cache"))
+        if op is None and wide:
+            op = "extend"
         if op is not None:
             if args:
                 log_fallback(op, ("positional arguments",), kwargs)
@@ -127,6 +133,8 @@ def with_kvcache(fallback: Callable) -> Callable:
                 run = select(op, kwargs)
                 if run is not None:
                     return run(**kwargs)
+        if wide:
+            return wide_kv.attend(fallback, kwargs, op)
         q, kc = kwargs.get("q"), kwargs.get("k_cache")
         if q is not None and kc is not None and kc.dtype == torch.float8_e4m3fn and q.dtype != kc.dtype:
             kwargs["q"] = q.to(kc.dtype)  # GreenAttentionBackend left the decode query in bf16
