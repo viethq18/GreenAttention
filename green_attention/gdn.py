@@ -19,6 +19,7 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import LinearAttn
 
 from green_attention import dispatch
 from green_attention import gdn_recurrent  # noqa: F401  (registers gdn kernels + replayssm hook)
+from green_attention import gdn_flush  # noqa: F401  (registers the replayssm commit hook)
 
 logger = logging.getLogger(__name__)
 

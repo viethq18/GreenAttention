@@ -1,14 +1,15 @@
 """Route each attention op to a green kernel or to the stock fallback.
 
 Ops: ``decode`` / ``verify`` (full-attention ``flash_attn_with_kvcache`` with
-``max_seqlen_q == 1`` / ``2..MAX_VERIFY_Q``) and ``gdn_decode`` / ``gdn_verify``
-(the GDN recurrent kernels). A kernel module registers a *selector* per op: it
+``max_seqlen_q == 1`` / ``2..MAX_VERIFY_Q``), ``gdn_decode`` / ``gdn_verify`` (the GDN
+recurrent kernels) and ``gdn_flush`` (the Replay-SSM checkpoint commit, hooked rather
+than selected). A kernel module registers a *selector* per op: it
 receives the call's keyword arguments and returns the callable to run, or a
 string saying why it declines. Selection depends only on shapes, dtypes and
 Python scalars, never on tensor data, so it is stable across CUDA graph capture
 and replay.
 
-``GREEN_ATTN_DISABLE=decode,verify,gdn_decode,gdn_verify`` (any subset) forces
+``GREEN_ATTN_DISABLE=decode,verify,gdn_decode,gdn_verify,gdn_flush`` (any subset) forces
 the fallback for those ops: the A/B switch. Every declined call logs once per
 signature (op, reasons, argument dtypes/shapes without the batch dimension).
 """
@@ -26,7 +27,7 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-OPS = ("decode", "verify", "gdn_decode", "gdn_verify")
+OPS = ("decode", "verify", "gdn_decode", "gdn_verify", "gdn_flush")
 MAX_VERIFY_Q = 16
 
 Selector = Callable[[dict], Union[Callable, str]]

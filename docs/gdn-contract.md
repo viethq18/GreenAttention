@@ -197,3 +197,94 @@ contention. Verify is bound by latency in its dependency chain at 2 CTAs/SM, not
 (ERR_NVGPUCTRPERM), so the limiter is inferred from stub timings. compute-sanitizer racecheck has not been run on
 the GDN kernels. The real-input check (`test_real_dump`) needs a server run with `GREEN_DUMP_GDN=1
 --disable-cuda-graph`.
+
+## 7. Flush / commit contract (`gdn_flush`, replayssm circular commit)
+
+### Call sites
+
+The flush is not part of decode/verify. It runs once per verify step, **eager** (outside CUDA graphs), after the
+verify kernels, for **all 48 GDN layers at once**:
+
+```
+DFlashWorkerV2._update_target_mamba_state_after_verify
+  → update_mamba_state_after_mtp_verify        (sglang/kernels/ops/attention/linear/gdn_replayssm_spec_decode.py)
+    → commit_gdn_replayssm_spec                (Triton cursor advance; NOT hooked)
+    → commit_gdn_replayssm_circular            (hooked target; green replaces the whole call)
+      → gdn_replayssm_compact_commit_kernel    (Triton fold; grid (2, B, HV·L))
+      → _finish_gdn_replayssm_circular_fold_kernel (Triton cursor reset)
+```
+
+All caller arguments are keyword; `_commit_around` requires `kwargs and not args`. The per-layer
+`gdn_replayssm_exact_fold_kernel` path and the `IS_FLUSH=True` branch (legacy `launch_mode="flush"`/`"both"`) are
+dead in production and not reimplemented.
+
+### Trigger
+
+In the verify kernel the running write position `wp` advances by the accepted length. The commit fires when
+`new_wp + 2·4 > 32` (max_cache_len 32, spec 4), i.e. for fp32 state `new_wp ∈ 25..28`. With accept ≈ 2.4 a row
+flushes roughly every 11 steps → steady-state fraction ≈ 0.09 rows/step (5 %–10 % measured band).
+
+### Tensors and semantics
+
+| tensor | shape | notes |
+|---|---|---|
+| `checkpoint_state` | [L, S, HV, V, K] fp32 | slot `state_batch_indices[i]`; read old, write new |
+| `d_cache`/`d_residual_cache` | [L, S2, HV, T, V] bf16 | ring, rows `phys = (base + t) mod 32` |
+| `k_cache`/`k_residual_cache` | [L, S2, H, T, K] bf16 | ring, physical rows |
+| `g_cache` | [L, S2, HV, T] fp32 | log-decay gate per (hv, t) |
+| `write_pos`/`cache_base`/`is_flush` | int32/int32/int8 [S2] | cursors; snapshotted then reset |
+| `replay_indices`, `accept_lens` | per row | replay slot, accepted count |
+
+Per flushing row (`n_hist = write_pos[replay]`, `mask = t < n_hist`):
+
+- `decay_t = exp(total − prefix_t)` for `t < len`, else 0; `total = Σ g[phys]`.
+- `u = (d + dres)·decay`, `hi = bf16(u)`, `lo = bf16(u − hi)` (same split as Triton).
+- `delta = Kᵀ·hi + Kᵀ·lo + Kresᵀ·hi + Kresᵀ·lo` (bf16 mma, fp32 accumulate).
+- `H_new = H_old · exp(total) + delta`, written to the same slot (read-modify-write in place).
+- Cursors are reset exactly as the Triton finish kernel: `cache_base += n_hist (mod 32)`, `write_pos = 0`,
+  `is_flush = 0`. Track rows additionally write the OLD state to `mamba_track_indices`; cursor untouched for them.
+
+Bit-exactness: **not bit-exact to Triton** on the state (different MMA/tile order). Measured (fp64 reference):
+green rel err 2.17e-6 vs Triton's own 2.17e-6 — identical error floor. Cursors are bit-identical. Deterministic
+run-to-run. Idle rows are skipped in the job list; `null_block_id` rows skipped; empty job list is a no-op.
+
+### Measured (`bench/bench_gdn_flush.py`, CUDA-graph replay, L2 flushed, ABBA; neighbor vLLM idle, util 0–17 %)
+
+48-layer scaled, commit path (cursor advance + fold), µs:
+
+| B | rows | Triton | Green | ratio |
+|---|---|---|---|---|
+| 1 | 0 (idle) | 8.2 | 7.3 | 0.89× |
+| 8 | 0 (idle) | 29.1 | 7.3 | 0.25× |
+| 32 | 0 (idle) | 114.9 | 7.0 | 0.06× |
+| 51 | 0 (idle) | 220.4 | 7.1 | 0.03× |
+| 8 | 9 % | 127.9 | 173.9 | 1.36× |
+| 32 | 9 % | 407.0 | 529.7 | 1.30× |
+| 51 | 5 % | 506.9 | 554.1 | 1.09× |
+| 51 | 9 % | 722.1 | 967.3 | 1.34× |
+| 51 | all (51) | 6257 | 8420 | 1.35× |
+
+Per flushing row: Triton 118 µs, green 165 µs (1.35–1.4×). The bench's fraction rows are a fixed
+`round(frac·B)` flushing rows, so they *are* the realistic per-step cost; at B=51 a step with zero flushing rows
+has probability 0.91⁵¹ ≈ 0.8 %, so the idle win almost never applies. Measured directly, green is slower in every
+realistic case: B=8 1.36×, B=32 1.30×, B=51 1.09× (5 %) / 1.34× (9 %). A linear model built from the all-rows
+case (`t_idle + n·per_row`) predicts parity at B=51 (769 vs 772 µs/step), but it disagrees with these direct
+measurements and is not used for the decision. Green idles at ~7 µs regardless of B (one persistent grid);
+Triton pays 220 µs at B=51 when nothing flushes, which only helps small, mostly idle batches.
+
+Roofline (B=51, L=4, one commit): 654 MB state r+w + 215 MB ring reads = 1.5 GB; contiguous-copy floor
+2.9–3.0 TB/s → **floor ≈ 517 µs**. Triton (6257 µs / 12) = 521 µs/4-layer ≈ 100 % of floor. Green 8420/12 =
+702 µs = 73 % of floor (2.12 vs 2.87 TB/s effective). Occupancy is NOT the limiter (grid 132/264/396 CTAs →
+694/719/718 µs); slot identity is irrelevant (712 µs); MMA is 2 % busy; bytes-in-flight is adequate (98 KB/SM vs
+15 KB Little's-law need). The residual gap is per-warp latency stalls in the 24-tile m-loop (LDSM→HMMA chains,
+60 B spill stores in the no-res variant). Triton matches its own floor because each of its 19584 tiny CTAs has a
+short, fully-pipelined t-loop; beating it requires restructuring the fold into Triton's shape (one small CTA per
+(64 v, hv, layer) slice), which conflicts with the persistent-grid design that gives the idle win.
+
+### Decision
+
+**Not shipped.** At the production flush fraction green is 9–36 % slower than Triton per step, and the flush is
+~2 % of a 30–40 ms step either way. The implementation (`green_attention/gdn_flush.py`,
+`csrc/sm90/gdn_flush/`, `op_test/sm90/test_gdn_flush.py`, `bench/bench_gdn_flush.py`, `gdn_flush` disable token)
+lives on branch `exp/gdn-flush` (27 op tests pass there). Revisit only with Triton's tile shape (one small CTA per
+(64 v, hv, layer) slice) plus a cheap idle early-out.
