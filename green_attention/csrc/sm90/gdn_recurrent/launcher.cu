@@ -23,18 +23,29 @@ void launch_decode(const gdn::DecodeParams& p, int batch, cudaStream_t stream) {
 
 template <typename ST>
 void launch_verify(const gdn::VerifyParams& p, int batch, cudaStream_t stream) {
+  constexpr int NST = 2;
+  constexpr int smem = gdn::verify_smem_bytes<ST, NST>();
   gdn::verify_prep_kernel<ST><<<static_cast<unsigned>(batch) * gdn::kH, 128, 0, stream>>>(p);
+  static const bool smem_ok = [] {
+    return cudaFuncSetAttribute(gdn::verify_kernel<ST, NST>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                smem) == cudaSuccess;
+  }();
+  TVM_FFI_ICHECK(smem_ok) << "green gdn_verify: cannot opt in to " << smem << " B dynamic smem";
+  int dev = 0, num_sms = 0;
+  cudaGetDevice(&dev);
+  cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev);
+  const int ntiles = batch * gdn::kHV;
   cudaLaunchConfig_t cfg = {};
-  cfg.gridDim = dim3(static_cast<unsigned>(batch) * gdn::kHV);
-  cfg.blockDim = dim3(128);
-  cfg.dynamicSmemBytes = 0;
+  cfg.gridDim = dim3(static_cast<unsigned>(ntiles < num_sms ? ntiles : num_sms));
+  cfg.blockDim = dim3(160);  // 4 consumer warps (state row = thread) + 1 producer warp
+  cfg.dynamicSmemBytes = smem;
   cfg.stream = stream;
   cudaLaunchAttribute attr;
   attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attr.val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = &attr;
   cfg.numAttrs = 1;
-  cudaLaunchKernelEx(&cfg, gdn::verify_kernel<ST>, p);
+  cudaLaunchKernelEx(&cfg, gdn::verify_kernel<ST, NST>, p, ntiles, batch);
 }
 
 template <typename ST, bool PACKED>

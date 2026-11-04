@@ -230,9 +230,35 @@ def test_verify_null_state_idx():
     assert c2["out"][qsl[1] : qsl[2]].abs().max().item() == 0.0
 
 
+def test_verify_back_to_back_calls():
+    """Each persistent CTA cycles its smem stages over many tiles; a consumer that reads a stage after
+    releasing it sees the next tile's scalars (intermittent wrong out / g_cache). Exercise it with many
+    synchronized calls whose cases alternate, every one checked against Triton."""
+    cases = []
+    for i, (lens, sd) in enumerate(
+        [([1, 2, 3, 4] * 12 + [4, 2, 3], torch.float32), ([4] * 13, torch.bfloat16), ([4] * 32, torch.float32)]
+    ):
+        B = len(lens)
+        call = gc.make_verify(state_dtype=sd, spec_lens=lens, seed=100 + i, slots=B + 40, ring_slots=B + 20,
+                              flush_rows=(B // 3,))
+        call["out"] = torch.zeros_like(call["out"])
+        ref = gc.clone_call(call)
+        ref_out = gc.triton_verify(ref)
+        qsl = call["query_start_loc"].tolist()
+        mask = torch.ones(qsl[-1], dtype=torch.bool, device=DEV)
+        mask[qsl[B // 3] : qsl[B // 3 + 1]] = False  # flushed row: output not defined
+        cases.append((call, ref_out, ref["g_cache"], mask))
+    for it in range(300):
+        call, ref_out, ref_g, mask = cases[it % len(cases)]
+        c = gc.clone_call(call)
+        _run_green_verify(c)
+        torch.cuda.synchronize()
+        o_err = (ref_out[mask].float() - c["out"][mask].float()).abs().max().item()
+        g_err = (ref_g - c["g_cache"]).abs().max().item()
+        assert o_err <= 1e-3 and g_err <= 1e-4, f"call {it}: out {o_err} g {g_err}"
+
+
 def test_verify_declines():
-    call = gc.make_verify(spec_lens=[4] * 8)
-    assert "batch" in _verify_can_use(call)  # below the measured crossover
     call = gc.make_verify(spec_lens=[4] * 32, state_dtype=torch.bfloat16)
     assert "bf16" in _verify_can_use(call)
     call = gc.make_verify(spec_lens=[4] * 32)

@@ -149,29 +149,38 @@ Candidates: decode
               D3 TMA 1D bulk prefetch of the S tile into smem + 2 CTAs/SM (adds smem round trip; measured
                  equal-or-worse than register-resident loads for a pure streaming op).
             verify
-              V1 CTA = (seq, hv), 4 warps, fp32 FFMA on CUDA cores, lane-group of 8 lanes per row, vectors from smem (chosen).
+              V1 CTA = (seq, hv), 4 warps, fp32 FFMA on CUDA cores, lane-group of 8 lanes per row, vectors from smem
+                 (first version, af747c1: 1.07-1.12x Triton, serialized load -> math -> store per CTA).
               V2 tensor-core tf32 mma (like Triton tl.dot): needs S through smem, 3xTF32 for accuracy parity, no
                  advantage when memory-bound; Triton's measured 40% HBM utilization is the latency of its serial
                  dot/solve chain, not FLOPs.
               V3 split V across 2 CTAs per (seq,hv) (Triton BV=64): doubles q/k/gating prologue work, helps only wave
                  quantization at tiny batch.
-Chosen    : D1 and V1. Both keep S in registers (no smem round trip), because a single streaming pass has no reuse.
-            Verify is split in two kernels chained with PDL: verify_prep_kernel (grid B*H, 128 thr, 63 regs, 5760 B
-            smem: q/k l2norm, g/beta gating, (I+A)^-1 factors) and verify_kernel (grid B*HV, 128 thr,
-            __launch_bounds__(128,2), 218 regs fp32 / 207 bf16, 13440 B smem). The main kernel waits on the PDL
-            signal before it reads the prep workspace (79.9 vs 82.5 us at B=32 against the other orders).
+              V4 V1's math in a persistent warp-specialized kernel: 1 producer warp streams (TMA state + cp.async aux)
+                 into 2 smem stages while 4 consumer warps compute the previous tile (chosen).
+Chosen    : D1 and V4. Decode keeps S in registers (no smem round trip), because a single streaming pass has no reuse.
+            Verify is split in two kernels chained with PDL: verify_prep_kernel (grid B*H, 128 thr, 96 regs, 6784 B
+            smem: q/k l2norm, g/beta gating, (I+A)^-1 factors) and verify_kernel (persistent, min(B*HV, 132) CTAs,
+            160 thr = 4 consumer warps + 1 producer warp, __launch_bounds__(160,1), 156 regs fp32 / 165 bf16).
+            Per tile (seq, hv) the producer issues one bulk TMA of the state (64 KB fp32) and cp.async of the aux
+            block (prep vectors, history d rows, coefs, scalars, v rows), both completing on full[s] (count 33 =
+            producer expect-tx + 32 cp.async arrivals). Consumers own state row v = thread, release the stage with
+            empty[s] (count 128) only after their last smem read; then only register -> global stores remain.
+            The state TMA of the first 2 tiles is issued before the PDL wait, so it overlaps the prep kernel.
 Tiling    : decode grid (V/R, B*HV), 32 threads; R = 8 for fp32 state, R = 16 for bf16 state at B >= 32 (else 8).
-            verify as above, 4 warps x 32 rows, 2 CTAs/SM.
-SMEM      : decode 0. verify: prep 5760 B, main 13440 B per CTA.
-Registers : decode R8 64-72, R16 96-119 (R32 ~167, not used). verify prep 63, main 218/207. 0 spills everywhere.
+            verify: 4 consumer warps x 32 rows per tile, 2 stages, tiles strided over the persistent CTAs.
+SMEM      : decode 0. verify: prep 6784 B static; main 2 x (state + 14 464 B aux) + 96 B = 160 096 B fp32 /
+            94 560 B bf16 dynamic (opt-in via cudaFuncSetAttribute), 1 CTA/SM.
+Registers : decode R8 64-72, R16 96-119 (R32 ~167, not used). verify prep 96, main 156/165. 0 spills everywhere.
 Workspace : one prep->main scratch, 256 sequence slots (~30 MB), allocated by _prewarm before CUDA-graph capture.
             Graph-safe (no host sync, fixed pointers): the replayssm hook also runs inside the captured
             target-verify graph (op_test: test_verify_graph_replay_matches_eager).
-Parallelism: decode B*HV*V/R CTAs (bs 51, R8: 39 168 warps-CTAs ~ 148 per SM resident). verify B*HV CTAs (bs 51: 2448, 9.3 waves of 264).
+Parallelism: decode B*HV*V/R CTAs (bs 51, R8: 39 168 warps-CTAs ~ 148 per SM resident). verify min(B*HV, 132)
+            persistent CTAs (bs 51: 2448 tiles, 18.5 per CTA).
 Precision : storage fp32|bf16, all math fp32, `exp`/`log` via fast-path intrinsics only where Triton uses the same.
             Re-association S k' -> e^g (S0 k') changes rounding only (measured state rel err <= 3e-8 fp32).
-Regime    : verify runs green only for fp32 state and B >= 16 (VERIFY_MIN_BATCH); bf16-state verify is 0.65-0.72x
-            Triton and B <= 8 is ~0.9x, so both decline to Triton. Decode is enabled for all B and both dtypes.
+Regime    : verify runs green for fp32 state at every batch (1.05x at B=1 to 1.37x at B=32). bf16-state verify is
+            0.74-0.90x Triton (B=96..16) and declines to Triton. Decode is enabled for all B and both dtypes.
 Fallback  : the selectors in `green_attention/gdn_recurrent.py` (`_select_packed`, `_select_split`,
             `_verify_can_use`); declines log their reason once per signature.
 ```
@@ -188,12 +197,141 @@ Fallback  : the selectors in `green_attention/gdn_recurrent.py` (`_select_packed
 | decode | bf16 | 8 | 15.1 | 16.2 | 0.93 | 47 % |
 | decode | bf16 | 32 | 43.0 | 41.8 | 1.03 | 72 % |
 | decode | bf16 | 51 | 64.4 | 62.6 | 1.03 | 77 % |
-| verify (q=4) | fp32 | 32 | 89.5 | 80.7 | 1.11 | 51 % |
-| verify (q=4) | fp32 | 51 | 126.0 | 115.1 | 1.09 | 57 % |
+| verify (q=4) | fp32 | 1 | 18.0 | 17.2 | 1.05 | 6 % |
+| verify (q=4) | fp32 | 8 | 33.7 | 29.8 | 1.13 | 29 % |
+| verify (q=4) | fp32 | 32 | 90.5 | 66.3 | 1.37 | 53 % |
+| verify (q=4) | fp32 | 51 | 128.0 | 94.4 | 1.36 | 58 % |
+
+Verify rows: V4 kernel, GPU idle (other tenant gone). `verify_bytes()` counts the minimum traffic: state read,
+occupied history rows (d, k, g) read, ring rows written (d+rawv, k+rawk, g) and activations; the older
+table used a cruder count, so its % are not comparable.
+
+Verify ABBA (`verify_opt/ab2.py`, median µs, 40 reps, L2 flushed, `[4]*B`, all-zero flush rows):
+
+| B | V4 | V1 (af747c1) | Triton | V4 vs Triton | V4 vs V1 |
+|---|---|---|---|---|---|
+| 16 | 42.8 | 51.0 | 54.4 | 1.27 | 1.19 |
+| 32 | 66.1 | 80.9 | 90.5 | 1.37 | 1.22 |
+| 51 | 94.6 | 116.4 | 128.3 | 1.36 | 1.23 |
+| 96 | 160.1 | – | 220.1 | 1.37 | – |
 
 Decode is HBM-bound for both kernels: Triton already streams the state at the same rate, so parity is the
 ceiling. A load-only stub reached 2.99 TB/s at B=51 fp32. The plan's 85 % BW target is missed by 2 points under
-contention. Verify is bound by latency in its dependency chain at 2 CTAs/SM, not by HBM. ncu is unavailable
-(ERR_NVGPUCTRPERM), so the limiter is inferred from stub timings. compute-sanitizer racecheck has not been run on
-the GDN kernels. The real-input check (`test_real_dump`) needs a server run with `GREEN_DUMP_GDN=1
---disable-cuda-graph`.
+contention. Verify V4 reaches 53-58 % of peak, short of the 80 % goal: at B=51 a fixed ~11 µs prep kernel and
+the pipeline fill (first state tile per CTA) are not hidden, and each CTA holds only 2 tiles in flight
+(160 KB smem). ncu is unavailable (ERR_NVGPUCTRPERM), so the limiter is inferred from stub timings.
+bf16-state verify on V4 is 0.74-0.90x Triton (Triton reads half the state bytes through the same pipe; V4's
+aux/prep cost does not shrink), so it still declines. The real-input check (`test_real_dump`) needs a server
+run with `GREEN_DUMP_GDN=1 --disable-cuda-graph`.
+
+Stage-reuse race (found and fixed before commit): consumers arrived on empty[s] and then still read the
+output / g coefficients (`scs`) of stage s, which the producer may already refill for tile i+NST. Symptom:
+intermittent wrong `out` (err 0.01-0.05) and `g_cache` (err up to ~30) in ~1 of 100 synchronized calls,
+invisible to single-call tests. Fix: read every smem value into registers before the arrive.
+`test_verify_back_to_back_calls` (300 synchronized calls alternating 3 cases vs Triton) failed 3/3 runs before
+the fix and passes 5/5 after; a 600-call alternating stress (sync and async) and the B=1..128 sweep are clean.
+
+compute-sanitizer (H100, `san_smoke.py gdn`, decode + prep + V4 verify):
+
+| tool | GDN result |
+|---|---|
+| memcheck | 0 errors |
+| racecheck | 0 hazards |
+| synccheck | 0 errors |
+| initcheck | 0 errors |
+
+initcheck runs unfiltered with `--check-api-memory-access no`. A `--kernel-name` filter makes initcheck
+unsound: writes by uninstrumented kernels are not recorded, so the first read in a filtered kernel reports
+uninitialized memory (repro: 0 errors unfiltered, 32 filtered). With api checking on, the host-side harness
+copies dominate the report.
+
+## 7. Flush / commit contract (`gdn_flush`, replayssm circular commit)
+
+### Call sites
+
+The flush is not part of decode/verify. It runs once per verify step, **eager** (outside CUDA graphs), after the
+verify kernels, for **all 48 GDN layers at once**:
+
+```
+DFlashWorkerV2._update_target_mamba_state_after_verify
+  → update_mamba_state_after_mtp_verify        (sglang/kernels/ops/attention/linear/gdn_replayssm_spec_decode.py)
+    → commit_gdn_replayssm_spec                (Triton cursor advance; NOT hooked)
+    → commit_gdn_replayssm_circular            (hooked target; green replaces the whole call)
+      → gdn_replayssm_compact_commit_kernel    (Triton fold; grid (2, B, HV·L))
+      → _finish_gdn_replayssm_circular_fold_kernel (Triton cursor reset)
+```
+
+All caller arguments are keyword; `_commit_around` requires `kwargs and not args`. The per-layer
+`gdn_replayssm_exact_fold_kernel` path and the `IS_FLUSH=True` branch (legacy `launch_mode="flush"`/`"both"`) are
+dead in production and not reimplemented.
+
+### Trigger
+
+In the verify kernel the running write position `wp` advances by the accepted length. The commit fires when
+`new_wp + 2·4 > 32` (max_cache_len 32, spec 4), i.e. for fp32 state `new_wp ∈ 25..28`. With accept ≈ 2.4 a row
+flushes roughly every 11 steps → steady-state fraction ≈ 0.09 rows/step (5 %–10 % measured band).
+
+### Tensors and semantics
+
+| tensor | shape | notes |
+|---|---|---|
+| `checkpoint_state` | [L, S, HV, V, K] fp32 | slot `state_batch_indices[i]`; read old, write new |
+| `d_cache`/`d_residual_cache` | [L, S2, HV, T, V] bf16 | ring, rows `phys = (base + t) mod 32` |
+| `k_cache`/`k_residual_cache` | [L, S2, H, T, K] bf16 | ring, physical rows |
+| `g_cache` | [L, S2, HV, T] fp32 | log-decay gate per (hv, t) |
+| `write_pos`/`cache_base`/`is_flush` | int32/int32/int8 [S2] | cursors; snapshotted then reset |
+| `replay_indices`, `accept_lens` | per row | replay slot, accepted count |
+
+Per flushing row (`n_hist = write_pos[replay]`, `mask = t < n_hist`):
+
+- `decay_t = exp(total − prefix_t)` for `t < len`, else 0; `total = Σ g[phys]`.
+- `u = (d + dres)·decay`, `hi = bf16(u)`, `lo = bf16(u − hi)` (same split as Triton).
+- `delta = Kᵀ·hi + Kᵀ·lo + Kresᵀ·hi + Kresᵀ·lo` (bf16 mma, fp32 accumulate).
+- `H_new = H_old · exp(total) + delta`, written to the same slot (read-modify-write in place).
+- Cursors are reset exactly as the Triton finish kernel: `cache_base += n_hist (mod 32)`, `write_pos = 0`,
+  `is_flush = 0`. Track rows additionally write the OLD state to `mamba_track_indices`; cursor untouched for them.
+
+Bit-exactness: **not bit-exact to Triton** on the state (different MMA/tile order). Measured (fp64 reference):
+green rel err 2.17e-6 vs Triton's own 2.17e-6 — identical error floor. Cursors are bit-identical. Deterministic
+run-to-run. Idle rows are skipped in the job list; `null_block_id` rows skipped; empty job list is a no-op.
+
+### Measured (`bench/bench_gdn_flush.py`, CUDA-graph replay, L2 flushed, ABBA; neighbor vLLM idle, util 0–17 %)
+
+48-layer scaled, commit path (cursor advance + fold), µs:
+
+| B | rows | Triton | Green | ratio |
+|---|---|---|---|---|
+| 1 | 0 (idle) | 8.2 | 7.3 | 0.89× |
+| 8 | 0 (idle) | 29.1 | 7.3 | 0.25× |
+| 32 | 0 (idle) | 114.9 | 7.0 | 0.06× |
+| 51 | 0 (idle) | 220.4 | 7.1 | 0.03× |
+| 8 | 9 % | 127.9 | 173.9 | 1.36× |
+| 32 | 9 % | 407.0 | 529.7 | 1.30× |
+| 51 | 5 % | 506.9 | 554.1 | 1.09× |
+| 51 | 9 % | 722.1 | 967.3 | 1.34× |
+| 51 | all (51) | 6257 | 8420 | 1.35× |
+
+Per flushing row: Triton 118 µs, green 165 µs (1.35–1.4×). The bench's fraction rows are a fixed
+`round(frac·B)` flushing rows, so they *are* the realistic per-step cost; at B=51 a step with zero flushing rows
+has probability 0.91⁵¹ ≈ 0.8 %, so the idle win almost never applies. Measured directly, green is slower in every
+realistic case: B=8 1.36×, B=32 1.30×, B=51 1.09× (5 %) / 1.34× (9 %). A linear model built from the all-rows
+case (`t_idle + n·per_row`) predicts parity at B=51 (769 vs 772 µs/step), but it disagrees with these direct
+measurements and is not used for the decision. Green idles at ~7 µs regardless of B (one persistent grid);
+Triton pays 220 µs at B=51 when nothing flushes, which only helps small, mostly idle batches.
+
+Roofline (B=51, L=4, one commit): 654 MB state r+w + 215 MB ring reads = 1.5 GB; contiguous-copy floor
+2.9–3.0 TB/s → **floor ≈ 517 µs**. Triton (6257 µs / 12) = 521 µs/4-layer ≈ 100 % of floor. Green 8420/12 =
+702 µs = 73 % of floor (2.12 vs 2.87 TB/s effective). Occupancy is NOT the limiter (grid 132/264/396 CTAs →
+694/719/718 µs); slot identity is irrelevant (712 µs); MMA is 2 % busy; bytes-in-flight is adequate (98 KB/SM vs
+15 KB Little's-law need). The residual gap is per-warp latency stalls in the 24-tile m-loop (LDSM→HMMA chains,
+60 B spill stores in the no-res variant). Triton matches its own floor because each of its 19584 tiny CTAs has a
+short, fully-pipelined t-loop; beating it requires restructuring the fold into Triton's shape (one small CTA per
+(64 v, hv, layer) slice), which conflicts with the persistent-grid design that gives the idle win.
+
+### Decision
+
+**Not shipped.** At the production flush fraction green is 9–36 % slower than Triton per step, and the flush is
+~2 % of a 30–40 ms step either way. The implementation (`green_attention/gdn_flush.py`,
+`csrc/sm90/gdn_flush/`, `op_test/sm90/test_gdn_flush.py`, `bench/bench_gdn_flush.py`, `gdn_flush` disable token)
+lives on branch `exp/gdn-flush` (27 op tests pass there). Revisit only with Triton's tile shape (one small CTA per
+(64 v, hv, layer) slice) plus a cheap idle early-out.

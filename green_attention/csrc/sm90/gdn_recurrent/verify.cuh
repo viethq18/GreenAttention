@@ -18,19 +18,24 @@
 //                       ring write of (k', residual), history scores khist_c . vec_m, per-value-
 //                       head decay, gating, (I+A)^-1 and the 4x4 F matrix.  Everything that does
 //                       not touch S0.  Results go to a persistent workspace.
-//   verify_kernel       grid (B, HV)  -- thread t owns state row v = t.  Issues all 64 KB of
-//                       state loads, then the 8 dots per row (butterfly reduce-scatter over the
-//                       8 lanes sharing a row), the history accumulate and a short scalar tail
-//                       (D, O and the output / ring stores).
+//   verify_kernel       persistent, min(B*HV, #SMs) CTAs of 160 threads, tiles (seq, hv) strided
+//                       over CTAs.  Warp 4 is the producer: bulk TMA of the 64 KB (fp32) state
+//                       tile and cp.async of the aux block (prep vectors, history d rows, coefs,
+//                       scalars, v rows) into one of NST=2 smem stages.  Warps 0-3 consume: thread
+//                       t owns state row v = t, 8 dots per row from smem, history accumulate,
+//                       scalar tail (D, O and the output / ring stores).  The state TMA of the
+//                       first NST tiles is issued before the PDL wait, so it overlaps prep.
 //
-// Why split: with the previous single kernel the serialized per-CTA post-load phase (norm/Gram
-// reduce, history scores, redundant gating tail) cost ~11 us with only 2 CTAs/SM, so the kernel was
-// latency-bound (~1.0x Triton) although the state stream alone runs at ~3 TB/s.
+// Why split + persistent: the post-load phase that does not touch S0 (norm/Gram reduce, history
+// scores, gating) cost ~11 us serialized inside each CTA, and a one-CTA-per-tile grid at 2 CTAs/SM
+// serialized load -> math -> store.  The producer warp now streams tile i+NST while the consumers
+// compute tile i.
 //
 // Math is fp32 FMA on CUDA cores (arithmetic is <10% of the FP32 peak at the HBM roofline),
 // i.e. it does not use TF32 and is more accurate than the Triton incumbent.
 #pragma once
 
+#include "common/ptx.cuh"
 #include "sm90/gdn_recurrent/kernel.cuh"
 
 namespace green {
@@ -48,6 +53,16 @@ constexpr int kScalars = 32;
 constexpr int kWsVecPerSeq = kH * 8 * kK;       // floats of ws_vec per sequence
 constexpr int kWsCoefPerSeq = kHV * kMaxRing * 8;
 constexpr int kWsScPerSeq = kHV * kScalars;
+
+// Dynamic smem of the persistent verify kernel: NST stages of (state tile + aux) followed by
+// NST Info records (32 B) and 2*NST mbarriers.  aux = vecs[8][K] f32 | dtile[32][V] bf16 |
+// coef[32][8] f32 | scs[32] f32 | vtile[4][V] bf16.
+constexpr int kVerifyAuxBytes = 8 * kK * 4 + kMaxRing * kV * 2 + kMaxRing * 8 * 4 + kScalars * 4 +
+                                kMaxSpec * kV * 2;
+template <typename ST, int NST>
+constexpr int verify_smem_bytes() {
+  return NST * (kV * kK * static_cast<int>(sizeof(ST)) + kVerifyAuxBytes) + NST * (32 + 16);
+}
 
 struct VerifyParams {
   const __nv_bfloat16* q;  // token 0, head 0 (q/k head stride = K, v/out head stride = V)
@@ -150,6 +165,15 @@ __device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wai
 __device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;\n" ::); }
 __device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;\n" ::: "memory"); }
 
+// Register select that LLVM cannot fold into a select of *addresses* (which demotes the whole
+// v[] array to local memory: 66 LDL/STL in the prep kernel before this).
+__device__ __forceinline__ float sel_f32(bool c, float a, float b) {
+  float r;
+  asm("{\n\t.reg .pred p;\n\tsetp.ne.u32 p, %3, 0;\n\tselp.f32 %0, %1, %2, p;\n\t}"
+      : "=f"(r) : "f"(a), "f"(b), "r"(static_cast<unsigned>(c)));
+  return r;
+}
+
 // 32-lane butterfly reduce-scatter of 32 values: lane c ends with the full sum of slot c.
 __device__ __forceinline__ float reduce_scatter32(float (&v)[32], int lane) {
 #pragma unroll
@@ -158,8 +182,9 @@ __device__ __forceinline__ float reduce_scatter32(float (&v)[32], int lane) {
     const bool hi = (lane >> s) & 1;
 #pragma unroll
     for (int i = 0; i < half; ++i) {
-      const float send = hi ? v[i] : v[i + half];
-      const float keep = hi ? v[i + half] : v[i];
+      const float a = v[i], b = v[i + half];
+      const float send = sel_f32(hi, a, b);
+      const float keep = sel_f32(hi, b, a);
       v[i] = keep + __shfl_xor_sync(kFull, send, half);
     }
   }
@@ -168,6 +193,17 @@ __device__ __forceinline__ float reduce_scatter32(float (&v)[32], int lane) {
 
 __device__ __forceinline__ int64_t load_idx(const void* p, int is64, int n) {
   return is64 ? static_cast<const int64_t*>(p)[n] : static_cast<int64_t>(static_cast<const int*>(p)[n]);
+}
+
+// cp.async.bulk 1D g2s with the completion tracked by an mbarrier transaction count.
+__device__ __forceinline__ void expect_tx(uint32_t bar, uint32_t bytes) {
+  asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(bar),
+               "r"(bytes) : "memory");
+}
+__device__ __forceinline__ void bulk_g2s(uint32_t dst, const void* src, uint32_t bytes, uint32_t bar) {
+  asm volatile(
+      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
+      ::"r"(dst), "l"(src), "r"(bytes), "r"(bar) : "memory");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -222,6 +258,23 @@ __global__ void __launch_bounds__(128) verify_prep_kernel(const VerifyParams p) 
     }
     if (w < kHV / kH && lane < W)
       gh = p.g_cache[r * p.g_ss + static_cast<int64_t>(h * (kHV / kH) + w) * L + ((base + lane) & Lm)];
+  }
+  // gate inputs of value head 3h+w (warps 0..2): issued with the other loads, not behind the
+  // block reductions
+  float araw[kMaxSpec], braw[kMaxSpec], dtb = 0.0f, Alog = 0.0f;
+  if (w < kHV / kH) {
+    const int hv0 = h * (kHV / kH) + w;
+#pragma unroll
+    for (int j = 0; j < kMaxSpec; ++j) {
+      araw[j] = 0.0f;
+      braw[j] = 0.0f;
+      if (j < nt) {
+        araw[j] = bf2f(p.a[(bos + j) * p.a_ts + hv0]);
+        braw[j] = bf2f(p.b[(bos + j) * p.b_ts + hv0]);
+      }
+    }
+    dtb = ldf(p.dt_bias, p.dt_bias_bf16, hv0);
+    Alog = p.A_log[hv0];
   }
 
   // ---- l2 norms and the kk / kq Gram entries from one fused block reduction --------------------
@@ -326,8 +379,6 @@ __global__ void __launch_bounds__(128) verify_prep_kernel(const VerifyParams p) 
     }
   }
 
-  const float dtb = ldf(p.dt_bias, p.dt_bias_bf16, hv);
-  const float Alog = p.A_log[hv];
   float g[kMaxSpec], beta[kMaxSpec], G[kMaxSpec], eG[kMaxSpec];
   float run = 0.0f;
 #pragma unroll
@@ -335,8 +386,8 @@ __global__ void __launch_bounds__(128) verify_prep_kernel(const VerifyParams p) 
     g[j] = 0.0f;
     beta[j] = 0.0f;
     if (j < nt) {
-      g[j] = softplus_gate(bf2f(p.a[(bos + j) * p.a_ts + hv]), dtb, Alog);
-      beta[j] = 1.0f / (1.0f + expf(-bf2f(p.b[(bos + j) * p.b_ts + hv])));
+      g[j] = softplus_gate(araw[j], dtb, Alog);
+      beta[j] = 1.0f / (1.0f + expf(-braw[j]));
     }
     run += g[j];
     G[j] = run;
@@ -387,179 +438,341 @@ __global__ void __launch_bounds__(128) verify_prep_kernel(const VerifyParams p) 
 }
 
 // ---------------------------------------------------------------------------------------------
-// main kernel: one CTA per (sequence, value head); 128 threads, thread t = state row t.
+// main kernel: persistent, warp-specialized.  min(B*HV, numSMs) CTAs, one per SM; tile
+// g = (sequence n, value head hv) -> n = g / kHV, hv = g % kHV, round-robin g = blockIdx + i*G.
+// Warp 4 is the producer: a 64 KB cp.async.bulk 1D copy of the state tile (fp32) or 4 x 16 KB
+// chunks (bf16) plus cp.async of every other input; warps 0..3 are consumers, thread t =
+// state row t, NST=2 stages in dynamic smem.  One mbarrier pair per stage: full[s] (count 33:
+// lane 0 expect_tx arrive + 32 cp.async arrives), empty[s] (128 consumer arrives).  A stage
+// (state tile + aux) is released to the producer while the next tile's loads are in flight,
+// so per-CTA compute overlaps the state stream of the next tile instead of serializing.
+//
+// Why persistent: at B=32 the old tile-per-CTA kernel ran ~6 waves of 2 CTAs/SM, each CTA
+// serializing load -> compute -> store (~15 us of compute exposed per kernel) and exposing
+// the prep latency of every wave behind its pdl_wait.  With one resident CTA per SM and a
+// 2-stage TMA pipeline the state stream never drains between tiles and the exposed prep
+// shrinks to the producer's single pdl_wait for its first tile.
 // ---------------------------------------------------------------------------------------------
-template <typename ST>
-__global__ void __launch_bounds__(128, 2) verify_kernel(const VerifyParams p) {
+template <typename ST, int NST>
+__global__ void __launch_bounds__(160, 1) verify_kernel(const VerifyParams p, int ntiles, int nseq) {
   using Tile = RawTile<ST>;
-  constexpr int VEC = StateVec<ST>::VEC;  // state columns per 16 B
-  constexpr int NI = 16 / VEC;            // column slices per row per lane (8 lanes x VEC x NI = K)
+  constexpr int VEC = StateVec<ST>::VEC;   // state columns per 16 B load
+  constexpr int NI = 16 / VEC;             // column slices per row per lane (8 lanes x VEC x NI = K)
 
-  __shared__ __align__(16) float vecs[8][kK];                  // q'_0..3, k'_0..3
-  __shared__ __align__(16) __nv_bfloat16 dtile[kMaxRing][kV];  // d history, row = ring offset
-  __shared__ __align__(16) float coef[kMaxRing][8];            // decay_c * (khist_c . vec_m)
-  __shared__ __align__(16) float scs[kScalars];
+  // stage layout (bytes): state tile | vecs[8][K] | dtile[32][V] | coef[32][8] | scs[32] |
+  // vtile[4][V]   (all bf16/f32 blocks 16 B aligned; the float offsets below are in floats)
+  constexpr int SB = kV * kK * static_cast<int>(sizeof(ST));       // state bytes
+  constexpr int VEC_B = 8 * kK * 4;        // vecs bytes
+  constexpr int DT_B = kMaxRing * kV * 2;  // dtile bytes
+  constexpr int CO_B = kMaxRing * 8 * 4;   // coef bytes
+  constexpr int SC_B = kScalars * 4;       // scs bytes
+  constexpr int AUX = VEC_B + DT_B + CO_B + SC_B + kMaxSpec * kV * 2;
+  static_assert(AUX == kVerifyAuxBytes, "launcher smem size out of sync");
+  constexpr int O_D = SB + VEC_B;                  // dtile byte offset in stage (after vecs)
+  constexpr int O_C = O_D + DT_B;                  // coef
+  constexpr int O_S = O_C + CO_B;                  // scs
+  constexpr int O_V = O_S + SC_B;                  // vtile
+
+  extern __shared__ __align__(128) char smem_raw[];
+  struct Info {  // written by producer lane 0 before its arrive on full[s]
+    int mode;    // 0 skip, 1 compute, 2 zero-fill
+    int nt, bos, r, wp, base, W, Lm;
+  };
+  char* tail = smem_raw + NST * (SB + AUX);
+  Info* info = reinterpret_cast<Info*>(tail);
+  static_assert(sizeof(Info) == 32, "launcher smem size out of sync");
+  uint64_t* bars = reinterpret_cast<uint64_t*>(tail + NST * sizeof(Info));
 
   const int t = threadIdx.x;
   const int lane = t & 31;
   const int w = t >> 5;
-  const int n = blockIdx.x / kHV;
-  const int hv = blockIdx.x % kHV;
-  const int h = hv / (kHV / kH);
 
-  // ---- uniform metadata and early exits -------------------------------------------------
-  const int64_t sidx = load_idx(p.state_idx, p.sidx64, n);
-  const int bos = p.qsl[n];
-  const int nt = min(p.qsl[n + 1] - bos, kMaxSpec);
-  if (nt <= 0) return;
-  if (sidx < 0) {  // NULL block: zero the outputs, nothing else
-    for (int j = 0; j < nt; ++j)
-      p.out[(bos + j) * p.o_ts + hv * kV + t] = __float2bfloat16_rn(0.0f);
+  if (t < 2 * NST) mbar_init(smem_u32(&bars[t]), (t & 1) ? 128u : 33u);
+  if (t == 0) asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+  __syncthreads();
+  uint32_t full[NST], empty[NST];
+#pragma unroll
+  for (int s = 0; s < NST; ++s) {
+    full[s] = smem_u32(&bars[2 * s]);
+    empty[s] = smem_u32(&bars[2 * s + 1]);
+  }
+
+  const int G = gridDim.x;
+
+  if (w == 4) {
+    // ---- producer: lane j holds the metadata of this CTA's tile i0+j (tile g = blockIdx + i*G;
+    // up to 32 tiles per refill, broadcast by shuffle so nothing is indexed dynamically), then
+    // per-tile loads ---------------------------------------------------------------------------
+    constexpr int kMB = 32;
+    int i0 = -1000000;
+    int m_bos = 0, m_nt = 0, m_wp = 0, m_cb = 0, m_fl = 1;
+    int64_t m_sd = -1, m_ri = -1;
+    const int L = p.L, Lm = L - 1;
+
+    auto ld_meta = [&](int ii) {
+      i0 = ii;
+      const int gg = blockIdx.x + (ii + lane) * G;
+      const int nn = max(0, min(gg / kHV, nseq - 1));  // this CTA's tile ii+lane -> its sequence
+      m_sd = load_idx(p.state_idx, p.sidx64, nn);
+      m_ri = load_idx(p.replay_idx, p.ridx64, nn);
+      const int b1 = p.qsl[nn], b2 = p.qsl[nn + 1];
+      int cb = 0, wp = 0, fl = 1;
+      if (m_ri >= 0) { cb = p.cache_base[m_ri]; wp = p.write_pos[m_ri]; fl = p.is_flush[m_ri]; }
+      m_bos = b1; m_nt = min(b2 - b1, kMaxSpec); m_wp = min(max(wp, 0), L);
+      m_cb = cb; m_fl = fl;
+    };
+
+    auto st_ = [&](int s) { return smem_raw + s * (SB + AUX); };
+
+    // Barrier accounting of a computed tile: lane 0 expect_tx arrive (1) + one noinc arrive per
+    // lane (32) = 33 = init count.  The bulk state TMA of the first NST tiles is issued before the
+    // pdl_wait (the checkpoint state is independent of prep); every cp.async that reads prep
+    // output goes strictly after it.
+    auto issue_state = [&](int hv, int s, int64_t sdv) {
+      const uint32_t dst = smem_u32(st_(s));
+      const ST* sbase = static_cast<const ST*>(p.state) + sdv * p.state_ss +
+                        static_cast<int64_t>(hv * kV) * kK;
+      if (lane == 0) expect_tx(full[s], SB);
+      if (sizeof(ST) == 4) {
+        if (lane == 0) bulk_g2s(dst, sbase, SB, full[s]);
+      } else if (lane < 4) {  // bf16 tile: 4 x 16 KB chunks
+        bulk_g2s(dst + lane * (SB / 4), sbase + lane * (kV * kK / 4), SB / 4, full[s]);
+      }
+    };
+    auto issue_aux = [&](int hv, int s, int n, int64_t riv, int bosn, int ntn, int W, int cbv) {
+      char* stg = st_(s);
+      if (W > 0) {
+        const __nv_bfloat16* dsrc = p.d_cache + riv * p.d_ss + static_cast<int64_t>(hv) * L * kV;
+        const uint32_t ddst = smem_u32(stg + O_D);
+        for (int idx = lane; idx < W * (kV / 8); idx += 32) {
+          const int c = idx >> 4, ch = idx & 15;
+          cp_async_16(ddst + (c * kV + ch * 8) * 2,
+                      dsrc + static_cast<int64_t>((cbv + c) & Lm) * kV + ch * 8);
+        }
+      }
+      const uint32_t vdst = smem_u32(stg + O_V);
+      for (int jj = lane; jj < kMaxSpec * (kV / 8); jj += 32) {
+        const int j = jj >> 4, ch = jj & 15;  // rows j >= nt re-read the last valid row (beta = 0)
+        cp_async_16(vdst + (j * kV + ch * 8) * 2,
+                    p.v + static_cast<int64_t>(bosn + min(j, ntn - 1)) * p.v_ts + hv * kV + ch * 8);
+      }
+      const int h = hv / (kHV / kH);
+      const float* vsrc = p.ws_vec + static_cast<int64_t>(n * kH + h) * (8 * kK);
+      const uint32_t adst = smem_u32(stg + SB);
+      for (int i = lane; i < VEC_B / 16; i += 32) cp_async_16(adst + 16 * i, vsrc + 4 * i);
+      if (W > 0) {
+        const float* csrc = p.ws_coef + static_cast<int64_t>(n * kHV + hv) * (kMaxRing * 8);
+        const uint32_t cdst = smem_u32(stg + O_C);
+        for (int i = lane; i < W * 2; i += 32) cp_async_16(cdst + 16 * i, csrc + 4 * i);
+      }
+      if (lane < kScalars / 4) {
+        const float* ssrc = p.ws_sc + static_cast<int64_t>(n * kHV + hv) * kScalars;
+        cp_async_16(smem_u32(stg + O_S) + 16 * lane, ssrc + 4 * lane);
+      }
+      cp_async_mbar_arrive_noinc(full[s]);
+    };
+
+    // Tile i of this CTA: its issue mode and metadata (fill() also publishes info[s]).
+    struct TM { int g, hv, bosn, ntn, wpn, cbn, mode; int64_t sdn, rin; };
+    auto fill = [&](int i, int s, TM& m) {
+      const int lk = i - i0;
+      m.hv = m.g % kHV;
+      m.bosn = __shfl_sync(kFull, m_bos, lk);
+      m.ntn = __shfl_sync(kFull, m_nt, lk);
+      m.wpn = __shfl_sync(kFull, m_wp, lk);
+      m.cbn = __shfl_sync(kFull, m_cb, lk);
+      const int fln = __shfl_sync(kFull, m_fl, lk);
+      m.sdn = __shfl_sync(kFull, m_sd, lk);
+      m.rin = __shfl_sync(kFull, m_ri, lk);
+      const bool live = fln == 0, has_state = m.sdn >= 0;
+      m.mode = (live && m.ntn > 0) ? (has_state ? 1 : 2) : 0;
+      if (lane == 0) {
+        if (m.mode == 1) info[s] = Info{1, m.ntn, m.bosn, static_cast<int>(m.rin), m.wpn, m.cbn, m.wpn, Lm};
+        else if (m.mode == 2) info[s] = Info{2, m.ntn, m.bosn, 0, 0, 0, 0, Lm};  // NULL state
+        else info[s] = Info{0, 0, 0, 0, 0, 0, 0, Lm};                             // skip
+      }
+    };
+
+    // ---- prologue: state tiles of the first NST stages, ahead of prep completion ---------------
+    ld_meta(0);
+    int npre = 0;
+#pragma unroll
+    for (int i = 0; i < NST; ++i) {
+      const int g = blockIdx.x + i * G;
+      if (g >= ntiles) break;
+      TM m;
+      m.g = g;
+      fill(i, i, m);
+      if (m.mode == 1) issue_state(m.hv, i, m.sdn);
+      ++npre;
+    }
+    pdl_wait();  // prep grid done: everything below may read its workspace
+
+    for (int i = 0;; ++i) {
+      const int g = blockIdx.x + i * G;
+      if (g >= ntiles) break;
+      const int s = i % NST;
+      TM m;
+      m.g = g;
+      if (i >= npre) {  // stages beyond the prologue: metadata window refill + empty wait
+        if (i - i0 >= kMB || i < i0) ld_meta(i);
+        mbar_wait(empty[s], ((i / NST) & 1) ^ 1);
+        fill(i, s, m);
+        if (m.mode == 1) issue_state(m.hv, s, m.sdn);
+      } else {
+        fill(i, s, m);  // same values as the prologue pass (info[s] rewritten identically)
+      }
+      if (m.mode == 1) {
+        issue_aux(m.hv, s, g / kHV, m.rin, m.bosn, m.ntn, m.wpn, m.cbn);
+      } else {
+        mbar_arrive(full[s]);                // 32 lane arrives + 1 extra = 33
+        if (lane == 0) mbar_arrive(full[s]);
+      }
+    }
     return;
   }
-  const int64_t r = load_idx(p.replay_idx, p.ridx64, n);
-  if (p.is_flush[r] != 0) return;  // the flush kernel owns this row
-  const int L = p.L;
-  const int Lm = L - 1;
-  const int base = p.cache_base[r];
-  const int wp = p.write_pos[r];
-  const int W = min(max(wp, 0), L);  // valid history rows
 
-  // The workspace written by the prep kernel is consumed first: the grid-dependency wait
-  // (griddepcontrol.wait) returns once the prep grid has completed and flushed its memory. The
-  // two grids still overlap through the launch/ramp-up of this one.
-  pdl_wait();
-  {
-    const float* vsrc = p.ws_vec + static_cast<int64_t>(n * kH + h) * (8 * kK);
-    for (int i = t; i < 8 * kK / 4; i += 128) cp_async16(&vecs[0][0] + 4 * i, vsrc + 4 * i);
-    if (W > 0) {
-      const float* csrc = p.ws_coef + (static_cast<int64_t>(n) * kHV + hv) * (kMaxRing * 8);
-      for (int i = t; i < W * 2; i += 128) cp_async16(&coef[0][0] + 4 * i, csrc + 4 * i);
+  // ---- consumers (warps 0..3): thread t = state row t ---------------------------------------
+  for (int i = 0;; ++i) {
+    const int g = blockIdx.x + i * G;
+    if (g >= ntiles) break;
+    const int s = i % NST;
+    mbar_wait(full[s], (i / NST) & 1);
+    const Info inf = info[s];
+    if (inf.mode == 0) { mbar_arrive(empty[s]); continue; }
+    const int hv = g % kHV;
+    char* st = smem_raw + s * (SB + AUX);
+    const float* vecs = reinterpret_cast<const float*>(st + SB);                    // [8][kK]
+    const __nv_bfloat16* dtile = reinterpret_cast<const __nv_bfloat16*>(st + O_D);  // [32][V]
+    const float* coef = reinterpret_cast<const float*>(st + O_C);                   // [32][8]
+    const float* scs = reinterpret_cast<const float*>(st + O_S);                    // [kScalars]
+    const __nv_bfloat16* vj = reinterpret_cast<const __nv_bfloat16*>(st + O_V);     // [4][V]
+
+    if (inf.mode == 2) {  // NULL state block: zero the output rows, nothing else
+      for (int j = 0; j < inf.nt; ++j)
+        p.out[static_cast<int64_t>(inf.bos + j) * p.o_ts + hv * kV + t] =
+            __float2bfloat16_rn(0.0f);
+      mbar_arrive(empty[s]);
+      continue;
     }
-    if (t < kScalars / 4)
-      cp_async16(&scs[4 * t], p.ws_sc + (static_cast<int64_t>(n) * kHV + hv) * kScalars + 4 * t);
-  }
-  // ---- issue the remaining long-latency loads: d history tile, v, and the state ----------------
-  if (W > 0) {  // d history tile -> smem (cp.async, 16 B)
-    const __nv_bfloat16* dsrc = p.d_cache + r * p.d_ss + static_cast<int64_t>(hv) * L * kV;
-    for (int idx = t; idx < W * (kV / 8); idx += 128) {
-      const int c = idx >> 4;
-      const int ch = idx & 15;
-      cp_async16(&dtile[c][ch * 8], dsrc + static_cast<int64_t>((base + c) & Lm) * kV + ch * 8);
-    }
-  }
-  float vj[kMaxSpec];
-#pragma unroll
-  for (int j = 0; j < kMaxSpec; ++j) vj[j] = j < nt ? bf2f(p.v[(bos + j) * p.v_ts + hv * kV + t]) : 0.0f;
 
-  typename Tile::T raw[8][NI];
-  {
-    const ST* sp = static_cast<const ST*>(p.state) + sidx * p.state_ss +
-                   static_cast<int64_t>(hv * kV + w * 32 + (lane >> 3) * 8) * kK + (lane & 7) * VEC;
-#pragma unroll
-    for (int j = 0; j < 8; ++j) {
-#pragma unroll
-      for (int i = 0; i < NI; ++i) raw[j][i] = Tile::load(sp + static_cast<int64_t>(j) * kK + i * 8 * VEC);
-    }
-  }
-
-  // ---- everything issued above lands here -------------------------------------------------------
-  cp_async_wait_all();
-  __syncthreads();
-
-  // ---- state dots: hw[m] = S0[v] . vec_m, two passes of 4 vectors (q' first, then k') ------------
-  float hw[8];
-#pragma unroll
-  for (int pass = 0; pass < 2; ++pass) {
-    float acc[8][4];
+    // ---- state dots: hw[m] = S0[t] . vec_m in one pass, then the 8-lane butterfly ----------
+    const ST* tile = reinterpret_cast<const ST*>(st);
+    const int c8 = lane & 7;               // one of the 8 lanes sharing 8 state rows
+    const ST* tl = tile + static_cast<int64_t>(32 * w + (lane >> 3) * 8) * kK + c8 * VEC;
+    float acc[8][8];
+    float hw[8];
 #pragma unroll
     for (int j = 0; j < 8; ++j)
 #pragma unroll
-      for (int mm = 0; mm < 4; ++mm) acc[j][mm] = 0.0f;
+      for (int m = 0; m < 8; ++m) acc[j][m] = 0.0f;
 #pragma unroll
-    for (int i = 0; i < NI; ++i) {
+    for (int i2 = 0; i2 < NI; ++i2) {
+      // state columns i2*8*VEC + c8*VEC .. +VEC of rows row0..row0+7 (vecs layout as in prep)
+      float4 vv[VEC / 4][8];
 #pragma unroll
-      for (int hh = 0; hh < VEC / 4; ++hh) {
-        float4 vv[4];
+      for (int hh = 0; hh < VEC / 4; ++hh)
 #pragma unroll
-        for (int mm = 0; mm < 4; ++mm)
-          vv[mm] = *reinterpret_cast<const float4*>(&vecs[4 * pass + mm][hh * 64 + (8 * i + (lane & 7)) * 4]);
+        for (int m = 0; m < 8; ++m) vv[hh][m] = ld16(vecs + m * kK + hh * 64 + (8 * i2 + c8) * 4);
+      if constexpr (VEC == 4) {
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
-          float sv[VEC];
-          Tile::unpack(raw[j][i], sv);
+          float sv[4];
+          Tile::unpack(Tile::load(tl + static_cast<int64_t>(j) * kK + i2 * 8 * VEC), sv);
 #pragma unroll
-          for (int mm = 0; mm < 4; ++mm) {
-            acc[j][mm] = fmaf(sv[hh * 4 + 0], vv[mm].x, acc[j][mm]);
-            acc[j][mm] = fmaf(sv[hh * 4 + 1], vv[mm].y, acc[j][mm]);
-            acc[j][mm] = fmaf(sv[hh * 4 + 2], vv[mm].z, acc[j][mm]);
-            acc[j][mm] = fmaf(sv[hh * 4 + 3], vv[mm].w, acc[j][mm]);
+          for (int m = 0; m < 8; ++m) {
+            acc[j][m] = fmaf(sv[0], vv[0][m].x, acc[j][m]);
+            acc[j][m] = fmaf(sv[1], vv[0][m].y, acc[j][m]);
+            acc[j][m] = fmaf(sv[2], vv[0][m].z, acc[j][m]);
+            acc[j][m] = fmaf(sv[3], vv[0][m].w, acc[j][m]);
           }
         }
-      }
-    }
-    // reduce over the 8 lanes of the row group; lane c keeps row c
-    const int c8 = lane & 7;
+      } else {  // bf16 state: one 16 B raw load covers two float4 halves of vecs
 #pragma unroll
-    for (int s = 2; s >= 0; --s) {
-      const int half = 1 << s;
-      const bool hi = (c8 >> s) & 1;
+        for (int j = 0; j < 8; ++j) {
+          float sv[8];
+          Tile::unpack(Tile::load(tl + static_cast<int64_t>(j) * kK + i2 * 8 * VEC), sv);
 #pragma unroll
-      for (int i = 0; i < half; ++i) {
+          for (int m = 0; m < 8; ++m)
 #pragma unroll
-        for (int mm = 0; mm < 4; ++mm) {
-          const float send = hi ? acc[i][mm] : acc[i + half][mm];
-          const float keep = hi ? acc[i + half][mm] : acc[i][mm];
-          acc[i][mm] = keep + __shfl_xor_sync(kFull, send, half);
+            for (int hh = 0; hh < 2; ++hh) {
+              acc[j][m] = fmaf(sv[4 * hh + 0], vv[hh][m].x, acc[j][m]);
+              acc[j][m] = fmaf(sv[4 * hh + 1], vv[hh][m].y, acc[j][m]);
+              acc[j][m] = fmaf(sv[4 * hh + 2], vv[hh][m].z, acc[j][m]);
+              acc[j][m] = fmaf(sv[4 * hh + 3], vv[hh][m].w, acc[j][m]);
+            }
         }
       }
     }
+    // reduce over the 8 lanes of the row group; lane c8 keeps row c8's full sums
 #pragma unroll
-    for (int mm = 0; mm < 4; ++mm) hw[4 * pass + mm] = acc[0][mm];
-  }
-
-  // ---- history correction: hw = total_decay * hw + sum_c d[c, v] * coef[c, :] -------------------
-  if (W > 0) {
-    const float total_decay = scs[28];
+    for (int sb = 2; sb >= 0; --sb) {
+      const int half = 1 << sb;
+      const bool hi = (c8 >> sb) & 1;
 #pragma unroll
-    for (int m = 0; m < 8; ++m) hw[m] *= total_decay;
-    for (int c = 0; c < W; ++c) {
-      const float dd = bf2f(dtile[c][t]);
-      const float4 c0 = *reinterpret_cast<const float4*>(&coef[c][0]);
-      const float4 c1 = *reinterpret_cast<const float4*>(&coef[c][4]);
-      hw[0] = fmaf(dd, c0.x, hw[0]); hw[1] = fmaf(dd, c0.y, hw[1]);
-      hw[2] = fmaf(dd, c0.z, hw[2]); hw[3] = fmaf(dd, c0.w, hw[3]);
-      hw[4] = fmaf(dd, c1.x, hw[4]); hw[5] = fmaf(dd, c1.y, hw[5]);
-      hw[6] = fmaf(dd, c1.z, hw[6]); hw[7] = fmaf(dd, c1.w, hw[7]);
+      for (int j = 0; j < half; ++j)
+#pragma unroll
+        for (int m = 0; m < 8; ++m) {
+          const float send = hi ? acc[j][m] : acc[j + half][m];
+          const float keep = hi ? acc[j + half][m] : acc[j][m];
+          acc[j][m] = keep + __shfl_xor_sync(kFull, send, half);
+        }
     }
-  }
+#pragma unroll
+    for (int m = 0; m < 8; ++m) hw[m] = acc[0][m];
 
-  // ---- tail: D and O for the spec tokens (T, beta, exp(G), F come precomputed) ----------------
-  float Rj[kMaxSpec], D[kMaxSpec];
+    // ---- history correction: hw *= total_decay; hw += sum_c d[c][t] * coef[c][m] ------------
+    if (inf.W > 0) {
+      const float total_decay = scs[28];
 #pragma unroll
-  for (int j = 0; j < kMaxSpec; ++j) Rj[j] = scs[6 + j] * (vj[j] - scs[10 + j] * hw[4 + j]);
-#pragma unroll
-  for (int i = 0; i < kMaxSpec; ++i) {
-    float s = Rj[i];  // T[i][i] = 1
-#pragma unroll
-    for (int j = 0; j < i; ++j) s = fmaf(Rj[j], scs[i * (i - 1) / 2 + j], s);
-    D[i] = s;
-  }
+      for (int m = 0; m < 8; ++m) hw[m] *= total_decay;
+      for (int c = 0; c < inf.W; ++c) {
+        const float dd = bf2f(dtile[c * kV + t]);
+        const float4 c0 = ld16(coef + c * 8), c1 = ld16(coef + c * 8 + 4);
+        hw[0] = fmaf(dd, c0.x, hw[0]); hw[1] = fmaf(dd, c0.y, hw[1]);
+        hw[2] = fmaf(dd, c0.z, hw[2]); hw[3] = fmaf(dd, c0.w, hw[3]);
+        hw[4] = fmaf(dd, c1.x, hw[4]); hw[5] = fmaf(dd, c1.y, hw[5]);
+        hw[6] = fmaf(dd, c1.z, hw[6]); hw[7] = fmaf(dd, c1.w, hw[7]);
+      }
+    }
 
+    // ---- tail: D, O and the output / ring stores (scs precomputed by prep) ------------------
+    float vjr[kMaxSpec];
 #pragma unroll
-  for (int j = 0; j < kMaxSpec; ++j) {
-    if (j >= nt) break;
-    float o = scs[10 + j] * hw[j];
+    for (int j = 0; j < kMaxSpec; ++j) vjr[j] = bf2f(vj[j * kV + t]);
+    float Rj[kMaxSpec], D[kMaxSpec];
 #pragma unroll
-    for (int i = 0; i <= j; ++i) o = fmaf(D[i], scs[18 + j * (j + 1) / 2 + i], o);
-    p.out[(bos + j) * p.o_ts + hv * kV + t] = __float2bfloat16_rn(o);
-    if (wp + j < L) {
-      const int64_t phys = (base + wp + j) & Lm;
-      const __nv_bfloat16 hi = __float2bfloat16_rn(D[j]);
-      const __nv_bfloat16 lo = __float2bfloat16_rn(D[j] - bf2f(hi));
-      p.d_cache[r * p.d_ss + (static_cast<int64_t>(hv) * L + phys) * kV + t] = hi;
-      p.rawv_cache[r * p.rawv_ss + (static_cast<int64_t>(hv) * L + phys) * kV + t] = lo;
-      if (t == 0) p.g_cache[r * p.g_ss + static_cast<int64_t>(hv) * L + phys] = scs[14 + j];
+    for (int j = 0; j < kMaxSpec; ++j) Rj[j] = scs[6 + j] * (vjr[j] - scs[10 + j] * hw[4 + j]);
+#pragma unroll
+    for (int i2 = 0; i2 < kMaxSpec; ++i2) {
+      float s2 = Rj[i2];  // T[i][i] = 1
+#pragma unroll
+      for (int j = 0; j < i2; ++j) s2 = fmaf(Rj[j], scs[i2 * (i2 - 1) / 2 + j], s2);
+      D[i2] = s2;
+    }
+    // Everything the stores need comes out of smem before the release: once all 128 consumers
+    // arrive, the producer refills this stage (scs included) for tile i + NST.
+    float o[kMaxSpec], gj[kMaxSpec];
+#pragma unroll
+    for (int j = 0; j < kMaxSpec; ++j) {
+      o[j] = scs[10 + j] * hw[j];
+#pragma unroll
+      for (int i2 = 0; i2 <= j; ++i2) o[j] = fmaf(D[i2], scs[18 + j * (j + 1) / 2 + i2], o[j]);
+      gj[j] = scs[14 + j];
+    }
+    mbar_arrive(empty[s]);  // stage released: every smem read of this tile is done
+#pragma unroll
+    for (int j = 0; j < kMaxSpec; ++j) {
+      if (j >= inf.nt) break;
+      p.out[static_cast<int64_t>(inf.bos + j) * p.o_ts + hv * kV + t] = __float2bfloat16_rn(o[j]);
+      if (inf.wp + j < p.L) {
+        const int phys = (inf.base + inf.wp + j) & inf.Lm;
+        const __nv_bfloat16 hi = __float2bfloat16_rn(D[j]);
+        const __nv_bfloat16 lo = __float2bfloat16_rn(D[j] - bf2f(hi));
+        p.d_cache[inf.r * p.d_ss + (static_cast<int64_t>(hv) * p.L + phys) * kV + t] = hi;
+        p.rawv_cache[inf.r * p.rawv_ss + (static_cast<int64_t>(hv) * p.L + phys) * kV + t] = lo;
+        if (t == 0) p.g_cache[inf.r * p.g_ss + static_cast<int64_t>(hv) * p.L + phys] = gj[j];
+      }
     }
   }
 }

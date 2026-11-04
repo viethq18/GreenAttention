@@ -42,10 +42,9 @@ MAX_SPEC = 4
 MAX_RING = 32
 # Workspace capacity in sequences (fp32): ~118 KB per sequence, ~30 MB total.
 WS_BATCH = 256
-# Verify is faster than Triton only from this batch (fp32 state, ABBA-measured
-# crossover between B=8 and B=32). Below it, and for bf16 state, the Triton
-# kernel stays. Both stay compilable and are covered by op_test.
-VERIFY_MIN_BATCH = 16
+# Verify runs green for fp32 state at every batch (ABBA: 1.03x at B=1 up to 1.38x
+# at B>=12 vs Triton). bf16-state verify is 0.74-0.90x Triton and stays on Triton;
+# the kernel stays compilable and covered by op_test.
 DUMP_PATH = "/network-volume/rnd-sglang/runs/green/gdn_dump.pt"
 
 _module = None
@@ -259,9 +258,6 @@ def _verify_regime(call) -> "str | None":
         return f"state dtype {getattr(st, 'dtype', st)}"
     if st.dtype is torch.bfloat16:
         return "bf16 state verify: Triton is faster on this regime"
-    B = int(call["replay_indices"].numel())
-    if B < VERIFY_MIN_BATCH:
-        return f"batch {B} < {VERIFY_MIN_BATCH}: Triton is faster on this regime"
     return None
 
 

@@ -5,7 +5,7 @@ Usage (on the H100 box, from the repo root):
 
 CUDA-graph-replayed launches, L2 flushed before each replay, CUDA events around
 the replay. Reports p10/median/p90 microseconds, GB/s of the minimum moved
-bytes (state read+write for decode; checkpoint read + ring r/w for verify),
+bytes (state read+write for decode; checkpoint read, occupied history read and ring write for verify),
 % of the 3.35 TB/s HBM spec, speedup and geomean. nvidia-smi is recorded next
 to every table (the GPU is shared: numbers under contention).
 """
@@ -84,13 +84,23 @@ def decode_bytes(call, B):
 
 
 def verify_bytes(call):
-    B = call["replay_indices"].numel()
-    st = call["checkpoint_state"][0].numel() * call["checkpoint_state"].element_size()
-    ring = 0
-    for t in ("d_cache", "rawv_cache", "k_cache", "rawk_cache", "g_cache"):
-        ring += call[t][0].numel() * call[t].element_size()
-    qkv = sum(call[t].numel() * 2 for t in ("q", "k", "v", "a", "b")) + call["out"].numel() * 2
-    return st * B + ring * B + qkv  # state read (h0) + ring r/w + activations
+    """Minimum HBM bytes of one verify call: checkpoint state read (h0), the occupied history
+    rows (d, k, g) read, the ring rows written (d+rawv, k+rawk, g), and the q/k/v/a/b/out
+    activations. History occupancy follows write_pos of the replayed rows."""
+    L = call["max_cache_len"]
+    isz = call["checkpoint_state"].element_size()
+    st = HV * V * K * isz
+    ridx = call["replay_indices"].to(torch.long)
+    qsl = call["query_start_loc"].tolist()
+    wp = call["write_pos"][ridx].clamp(0, L).tolist()
+    hist_row = HV * V * 2 + H * K * 2 + HV * 4  # d + k + g bytes of one history row
+    wr_tok = HV * V * 2 * 2 + H * K * 2 * 2 + HV * 4  # d,rawv + k,rawk + g bytes of one token
+    tot = 0
+    for n in range(ridx.numel()):
+        nt = min(qsl[n + 1] - qsl[n], 4)
+        tot += st + wp[n] * hist_row + min(nt, max(L - wp[n], 0)) * wr_tok
+    act = sum(call[t].numel() * 2 for t in ("q", "k", "v", "a", "b")) + call["out"].numel() * 2
+    return tot + act
 
 
 def bench_decode():
@@ -174,7 +184,7 @@ def main():
     print(f"gpu: {torch.cuda.get_device_name()}   [nvidia-smi: {gpu_state()}]")
     globals()["timed"].__globals__["FLUSH"] = FLUSH
     gd = report("GDN packed decode (graph-replayed, L2 flushed)", bench_decode())
-    gv = report("GDN replayssm verify (fp32 state, B>=16 only; graph-replayed)", bench_verify())
+    gv = report("GDN replayssm verify (fp32 state; graph-replayed, L2 flushed)", bench_verify())
     if gd and gv:
         print(f"overall geomean: {(gd * gv) ** 0.5:.3f}x")
 
