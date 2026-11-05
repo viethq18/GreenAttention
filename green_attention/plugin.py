@@ -1,7 +1,9 @@
 """SGLang plugin entry point: registers the ``green`` attention backend and the
-GDN kernel hook. Launch with ``--attention-backend green
---speculative-draft-attention-backend fa4`` (the DFLASH draft stays on FA4: its
-fp8 -> bf16 draft KV override and draft backend map key on ``"fa4"``)."""
+GDN kernel hook. Launch with ``--attention-backend green``. The speculative draft
+backend depends on the algorithm (``EXPECTED_DRAFT_BACKENDS``): DFLASH keeps its
+draft on FA4 (``--speculative-draft-attention-backend fa4``: its fp8 -> bf16
+draft KV override and draft backend map key on ``"fa4"``); the Gemma 4 MTP draft
+(FROZEN_KV_MTP) runs on green, so leave that flag unset."""
 
 from __future__ import annotations
 
@@ -22,6 +24,8 @@ SGLANG_READS = {
         "add_radix_supported_deterministic_attention_backend_choices",
     ),
     "srt/runtime_context.py": ("get_spec",),
+    "srt/model_executor/model_runner.py": ("is_draft_worker",),
+    "srt/arg_groups/speculative_hook.py": ('"FROZEN_KV_MTP"',),
     "srt/arg_groups/fields/spec.py": (
         "speculative_algorithm",
         "speculative_draft_attention_backend",
@@ -39,26 +43,42 @@ SGLANG_READS = {
 }
 
 
+# Speculative algorithm -> the draft attention backends that go with a green target (None: the flag is
+# unset and the draft runner inherits the target's backend). Any other algorithm expects fa4.
+# FROZEN_KV_MTP (Gemma 4 assistant draft) reads the target's KV cache, including the e4m3 head_dim 512
+# global layers that FA4 cannot attend on SM90. With topk 1 the draft runs on the target's backend,
+# green's decode kernels taking every draft call (q_len 1); topk > 1 needs its own triton backend.
+EXPECTED_DRAFT_BACKENDS = {
+    "FROZEN_KV_MTP": (None, BACKEND, "triton"),
+}
+DEFAULT_DRAFT_BACKENDS = ("fa4",)
+
+
 def _create_green_backend(runner):
     from green_attention.backend import GreenAttentionBackend
 
-    spec = _draft_backend()
-    if spec is not None and spec != "fa4":
+    algorithm, draft = _spec_backends()
+    expected = EXPECTED_DRAFT_BACKENDS.get(algorithm, DEFAULT_DRAFT_BACKENDS)
+    if runner.is_draft_worker:
+        logger.info("green_attention: serving the %s draft", algorithm)
+    elif draft is not None and draft not in expected:
         logger.warning(
-            "green_attention: target backend is green but the speculative draft runs on "
-            "%r; pass --speculative-draft-attention-backend fa4 to match production",
-            spec,
+            "green_attention: target backend is green but the %s draft runs on %r; expected %s",
+            algorithm,
+            draft,
+            " or ".join("unset" if b is None else repr(b) for b in expected),
         )
     return GreenAttentionBackend(runner)
 
 
-def _draft_backend():
+def _spec_backends():
+    """(speculative algorithm, --speculative-draft-attention-backend), (None, None) without spec."""
     from sglang.srt.runtime_context import get_spec
 
     spec = get_spec()
     if spec.speculative_algorithm is None:
-        return None
-    return spec.speculative_draft_attention_backend
+        return None, None
+    return spec.speculative_algorithm, spec.speculative_draft_attention_backend
 
 
 # Gemma4's backend check in model_hook.handle_model_specific_adjustments is a literal
