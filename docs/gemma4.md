@@ -208,3 +208,32 @@ FA4's bf16 kernel does run HD512, so the `green` backend handles the calls its k
 Tests: `test/unit/test_wide_kv.py` (CPU: dequant/descale/page remap, request groups, routing, capture refusal)
 and `op_test/sm90/test_wide_kv.py` (real FA4 vs an fp32 reference on calls green declines: prefill with prefix,
 page 1/64, descale forms, declined decode, request groups).
+
+## MTP drafter (`google/gemma-4-31B-it-assistant`)
+
+The assistant model (`Gemma4AssistantForCausalLM`, 4 layers: 3 sliding + 1 global) has no KV cache of its
+own: SGLang promotes `--speculative-algorithm NEXTN` (or `EAGLE`) with this draft to `FROZEN_KV_MTP`, and every
+draft layer attends the target's cache. Its attention shapes are the target's (q32, sliding kv16 hd256 window
+1023, global kv4 hd512), so green serves it with no new kernel:
+
+- With `--speculative-eagle-topk 1` the draft runs on the target runner's backend. Leave
+  `--speculative-draft-attention-backend` unset (or `green`): the draft then builds `GreenAttentionBackend`,
+  each draft step is a q_len 1 decode on the green decode kernels, captured by `FrozenKVMTPCudaGraphRunner`.
+  Sliding-window ids are translated on the target's SWA pool (`FlashAttentionBackend._frozen_window_space`).
+- Not `fa4`: FA4 cannot attend the e4m3 hd512 global layer on SM90, and the `wide_kv` fallback raises under
+  capture. The plugin warns when the target is green and the FROZEN_KV_MTP draft backend is not unset,
+  `green` or `triton` (`plugin.EXPECTED_DRAFT_BACKENDS`); DFLASH still expects `fa4`.
+- `--speculative-eagle-topk` > 1 requires `--speculative-draft-attention-backend triton` (SGLang's own
+  restriction); green then serves only the target.
+- Verify runs on the target backend with q_len = `--speculative-num-draft-tokens`: sliding q <= 16 on the decode
+  kernel (longer on FA4), global q <= 8 on the decode kernel and any longer q on `attn_extend`.
+- Pass `--kv-cache-dtype fp8_e4m3` explicitly: the draft reads the target pool, which must be e4m3.
+
+```
+SGLANG_PLUGINS=green_attention python -m sglang.launch_server --model-path <gemma-4-31B-it-FP8-block> \
+  --attention-backend green --kv-cache-dtype fp8_e4m3 \
+  --speculative-algorithm NEXTN --speculative-draft-model-path google/gemma-4-31B-it-assistant \
+  --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
+```
+
+Tests: `test/unit/test_plugin.py` (draft-backend warning per algorithm).
