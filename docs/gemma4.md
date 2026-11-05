@@ -237,3 +237,26 @@ SGLANG_PLUGINS=green_attention python -m sglang.launch_server --model-path <gemm
 ```
 
 Tests: `test/unit/test_plugin.py` (draft-backend warning per algorithm).
+
+### Adaptive draft length
+
+The number of draft steps can follow the load at runtime (sglang fork, opt-in):
+`--speculative-adaptive --speculative-adaptive-config <json>`. The default `"acceptance"` policy moves `k`
+with the EMA accept length; `"policy": "goodput"` picks, per CUDA-graph batch-size bucket, the candidate `k`
+that maximizes `E[tokens | k] / T(k)`. Here the per-position acceptance is learned from verify results, and
+`T` is the GPU time of the decode step, measured with CUDA events. Small batches therefore keep a deep draft,
+and large batches shrink `k`, down to 0 if it is a candidate. `--speculative-num-steps` must be one of the
+candidates.
+
+```json
+{"policy": "goodput",
+ "1": {"candidate_steps": [2, 3, 5]}, "16": {"candidate_steps": [1, 2, 3]}, "64": {"candidate_steps": [0, 1, 2]}}
+```
+
+- Every candidate `k` gets its own draft `GreenAttentionBackend` and `FrozenKVMTPCudaGraphRunner`, because the
+  runner keeps graph state on the backend. It also gets its own target verify graphs at q_len `k + 1`. Memory
+  grows with the size of the candidate union.
+- `k = 0` verifies only the bonus token (a q_len 1 decode) but still runs the MTP draft-extend, so the next
+  `k > 0` step drafts from the current position.
+- The verify q_len stays at or below 8 for `k <= 7`, so every candidate keeps both layer types on the decode
+  kernels.
