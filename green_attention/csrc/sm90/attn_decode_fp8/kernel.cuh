@@ -74,6 +74,7 @@ struct Cfg {
   static constexpr uint32_t BAR_OFF = SVT_OFF + VT_STAGES * V_BYTES;
   static constexpr uint32_t PLAN_OFF = BAR_OFF + 128;  // int: tiles-per-CTA quota chosen by warp 0
   static constexpr uint32_t SMEM_BYTES = PLAN_OFF + 16;
+  static constexpr int PLAN_SEQS = K_BYTES / 4;  // plan_quota tile cache (in sK, idle until the quota is set)
   static constexpr uint32_t SMEM_ALLOC = SMEM_BYTES + 1024;  // slack for 1024 B alignment
   static_assert(GQA * MAX_Q <= M_TILE && MAX_Q >= 1, "q rows");
   static_assert(DSPLIT == 1 || DSPLIT == 2, "head_dim 256 or 512");
@@ -203,12 +204,14 @@ constexpr float PLAN_C0 = 2.0f;
 // fills the GPU without wave-quantization losses. Candidate s = 1..num_splits gives quota ceil(max_tiles / s);
 // the estimated makespan is min(waves * (quota + c0), total / SMs + quota + c0) (uniform-wave bound vs.
 // list-scheduling bound). Ties go to fewer splits. Must be called by one full warp; all lanes get the result.
-// Depends only on device memory, so it is CUDA-graph safe.
+// Depends only on device memory, so it is CUDA-graph safe. `tiles` caches the first C::PLAN_SEQS tile counts:
+// one lane per candidate re-reading cache_seqlens serially cost every CTA 8-33 us at batch 16-128 (H200).
 template <class C>
-__device__ __forceinline__ int plan_quota(const Params& p, int lane) {
+__device__ __forceinline__ int plan_quota(const Params& p, int lane, int* tiles) {
   int mx = 0, tot = 0;
   for (int b = lane; b < p.batch; b += 32) {
     const int t = seq_tiles<C>(p, b).y;
+    if (b < C::PLAN_SEQS) tiles[b] = t;
     mx = max(mx, t);
     tot += t;
   }
@@ -218,19 +221,27 @@ __device__ __forceinline__ int plan_quota(const Params& p, int lane) {
     tot += __shfl_xor_sync(0xffffffffu, tot, o);
   }
   if (mx <= 1) return 1;
+  __syncwarp();
   const int units = static_cast<int>(gridDim.y);
   const float total = static_cast<float>(units * tot);
   const float sms = static_cast<float>(p.sm_count);
+  const int ns = p.num_splits;
+  // `width` candidates per pass; the 32 / width lanes sharing a candidate split its batch loop.
+  const int width = ns >= 32 ? 32 : 1 << (32 - __clz(ns - 1));
+  const int b_step = 32 / width;
   float best = INFINITY;
   int best_s = 1;
-  for (int s = lane + 1; s <= p.num_splits; s += 32) {
+  for (int s0 = 1; s0 <= ns; s0 += width) {
+    const int s = s0 + lane % width;
     const int quota = (mx + s - 1) / s;
     int nc = 0;
 #pragma unroll 4
-    for (int b = 0; b < p.batch; ++b) {
-      const int t = seq_tiles<C>(p, b).y;
+    for (int b = lane / width; b < p.batch; b += b_step) {
+      const int t = b < C::PLAN_SEQS ? tiles[b] : seq_tiles<C>(p, b).y;
       nc += max((t + quota - 1) / quota, 1);
     }
+    for (int o = 16; o >= width; o >>= 1) nc += __shfl_xor_sync(0xffffffffu, nc, o);
+    if (s > ns) continue;
     nc *= units;
     const float job = static_cast<float>(quota) + PLAN_C0;
     const float est = fminf(ceilf(static_cast<float>(nc) / sms) * job,
@@ -387,7 +398,7 @@ __global__ void __launch_bounds__(THREADS, 1) attn_decode_kernel(const __grid_co
     }
   }
   if (SPLIT && warp == 0) {
-    const int q = plan_quota<C>(p, lane);
+    const int q = plan_quota<C>(p, lane, reinterpret_cast<int*>(smem_gen + C::SK_OFF));
     if (lane == 0) *reinterpret_cast<int*>(smem_gen + C::PLAN_OFF) = q;
   }
   __syncthreads();

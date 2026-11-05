@@ -80,6 +80,12 @@ not `[batch, kv_heads]`. All of these run on FA4.
   overwrite a stage another warp was still reading (racecheck hazard with `V_STAGES = 1` in the HD512 instance).
 - **Split planner on window-capped context.** Splits are planned over the tiles in `[t_lo, t_end)`, never the
   full context. Otherwise a long sliding sequence gets mostly-empty splits that the combine has to weight by 0.
+- **Planner tile cache lives in sK.** Warp 0 caches the per-sequence tile counts in the first K stage before
+  the `__syncthreads` that publishes the quota; no K load is issued into sK before that barrier. Each candidate's
+  batch loop is split across `32 / width` lanes. The previous one-lane-per-candidate loop re-read
+  `cache_seqlens` serially and cost every CTA 8-33 us at batch 16-128. H200, L2 flushed, ABBA, ctx 8192, q 4,
+  global TP4: bs 64 230.3 -> 217.9 us, bs 128 432.9 -> 402.4 us; global TP2 bs 64 and Qwen bs 32/64 about 3-4 %
+  faster; sliding unchanged; bs 8 about 0.5-1 us slower (smem fill + `__syncwarp`). Output bitwise identical.
 - **Window is compile-time (`Cfg::WINDOW`).** A runtime-only window (`|| col < lo` in the mask plus
   `|| n0 < lo_max` in `need_mask`, never taken at `window_left = -1`) slowed the Qwen main kernel by 5-7 %
   (bs 51, min over 60 L2-flushed calls: 8k 328 -> 357 us, 32k 1239 -> 1337 us): it changes the codegen of the
