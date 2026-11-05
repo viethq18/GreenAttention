@@ -1,13 +1,19 @@
 """ABBA benchmark of the SM90 FP8 decode/verify kernel against the FA4 fallback.
 
-  python bench/bench_attn_decode.py --abba                      # full grid
-  python bench/bench_attn_decode.py --bs 32 --ctx 32768 --qlen 1 --abba
+  python bench/bench_attn_decode.py --abba                                  # qwen grid
+  python bench/bench_attn_decode.py --shape gemma-swa --bs 1 8 32 64 --abba
+  python bench/bench_attn_decode.py --shape gemma-global --ctx 32768 --abba
 
-Grid: bs {1,8,32,51} x ctx {2k,8k,32k,128k} x q_len {1,4}. Each config runs rounds of
-A B B A (A = FA4 fallback, B = green) in one process, one CUDA-event pair per call with an L2 flush
-before every call (cold L2; --warm-l2 disables the flush). Reports the median over all calls of
-each side. KV bytes per call (the roofline numerator) = sum(ctx) * 2 KB (K+V, 4 heads, 256, e4m3);
-the q/out traffic is < 0.1 % of that and ignored. Configs whose KV pool exceeds --max-gb are skipped.
+Grid: bs {1,8,32,51} x ctx {2k,8k,32k,128k} x q_len {1,4} (per-shape head geometry below). Each
+config runs rounds of A B B A (A = FA4 fallback, B = green) in one process, one CUDA-event pair per
+call with an L2 flush before every call (cold L2; --warm-l2 disables the flush). Reports the median
+over all calls of each side. KV bytes per call (the roofline numerator) = sum(ctx) * kv_bytes/token
+(K+V); for gemma-swa the FA4/green cost is windowed, so the effective tokens are capped at
+window+q_len per row and both %BW columns use that cap. Configs whose KV pool exceeds --max-gb are
+skipped.
+
+gemma-global (head_dim 512): FA4-SM90 has no FP8 path for head_dim > 256 (it asserts), so A is FA4 on
+a bf16 copy of the same q/K/V (what --kv-cache-dtype auto serves); its bytes are counted at 2 B/elem.
 """
 
 from __future__ import annotations
@@ -21,10 +27,15 @@ import torch
 
 from green_attention import attn_decode
 
-HD, KVH, QH = 256, 4, 24
 FP8 = torch.float8_e4m3fn
 HBM_GBPS = 3350.0
-BYTES_PER_TOKEN = 2 * KVH * HD  # K + V, e4m3
+
+# name -> (HD, KVH, QH, GQA, window_left) — window None = full attention
+SHAPES = {
+    "qwen": (256, 4, 24, 6, None),
+    "gemma-swa": (256, 16, 32, 2, 1023),   # sglang passes sliding_window_size - 1
+    "gemma-global": (512, 4, 32, 8, None),
+}
 
 
 def smi() -> str:
@@ -36,7 +47,8 @@ def smi() -> str:
         return f"nvidia-smi unavailable ({exc})"
 
 
-def build(bs: int, ctx: int, qlen: int, page: int, seed: int = 0):
+def build(bs: int, ctx: int, qlen: int, page: int, shape: str = "qwen", seed: int = 0):
+    HD, KVH, QH, _, window = SHAPES[shape]
     dev = "cuda"
     g = torch.Generator(device=dev).manual_seed(seed)
     pages_per = -(-ctx // page)
@@ -58,8 +70,9 @@ def build(bs: int, ctx: int, qlen: int, page: int, seed: int = 0):
     return dict(
         q=q, k_cache=k, v_cache=v, page_table=pt,
         cache_seqlens=torch.full((bs,), ctx, dtype=torch.int32, device=dev),
-        cu_seqlens_q=cu, max_seqlen_q=qlen, softmax_scale=HD ** -0.5, causal=True,
-        window_size=(-1, -1), softcap=0.0, return_softmax_lse=False, num_splits=0,
+        cu_seqlens_q=cu, max_seqlen_q=qlen, softmax_scale=1.0, causal=True,
+        window_size=(-1, -1) if window is None else (window, 0), softcap=0.0,
+        return_softmax_lse=False, num_splits=0,
         k_descale=torch.full((1,), 0.5, device=dev).expand(bs, KVH),
         v_descale=torch.full((1,), 0.5, device=dev).expand(bs, KVH),
         max_seqlen_k=ctx,
@@ -86,6 +99,7 @@ def pct(xs, p):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--shape", choices=sorted(SHAPES), default="qwen")
     ap.add_argument("--bs", type=int, nargs="*", default=[1, 8, 32, 51])
     ap.add_argument("--ctx", type=int, nargs="*", default=[2048, 8192, 32768, 131072])
     ap.add_argument("--qlen", type=int, nargs="*", default=[1, 4])
@@ -107,37 +121,49 @@ def main():
     print(hdr)
     speedups = []
     skipped = []
+    HD, KVH, QH, _, window = SHAPES[args.shape]
+    a_bf16 = HD > 256  # see module docstring
+    BYTES_PER_TOKEN = 2 * KVH * HD  # K + V, e4m3
     for qlen in args.qlen:
         for ctx in args.ctx:
             for bs in args.bs:
-                gb = bs * ctx * BYTES_PER_TOKEN / 1e9
+                gb = bs * ctx * BYTES_PER_TOKEN * (3 if a_bf16 else 1) / 1e9
                 if gb > args.max_gb:
                     skipped.append((bs, ctx, qlen, gb))
                     continue
-                kw = build(bs, ctx, qlen, args.page)
+                kw = build(bs, ctx, qlen, args.page, args.shape)
                 green = attn_decode.select(kw)
                 assert callable(green), green
-                splits = attn_decode.plan_splits(bs, ctx, attn_decode._S.sm_count[0])
-                fa4(**kw)
+                kw_a = kw
+                if a_bf16:
+                    kw_a = {k: v for k, v in kw.items() if k not in ("k_descale", "v_descale")}
+                    kw_a.update(q=kw["q"].to(torch.bfloat16), k_cache=kw["k_cache"].to(torch.bfloat16) * 0.5,
+                                v_cache=kw["v_cache"].to(torch.bfloat16) * 0.5)
+                units = KVH * (2 if HD == 512 else 1)
+                splits = attn_decode.plan_splits(bs, ctx, attn_decode._S.sm_count[0], units, windowed=window is not None)
+                fa4(**kw_a)
                 green(**kw)
                 torch.cuda.synchronize()
                 a, b = [], []
                 for _ in range(args.rounds):  # A B B A
-                    a += time_calls(fa4, kw, args.iters, flush)
+                    a += time_calls(fa4, kw_a, args.iters, flush)
                     b += time_calls(green, kw, args.iters, flush)
                     b += time_calls(green, kw, args.iters, flush)
-                    a += time_calls(fa4, kw, args.iters, flush)
+                    a += time_calls(fa4, kw_a, args.iters, flush)
                 ta, tb = statistics.median(a), statistics.median(b)
-                bytes_ = bs * ctx * BYTES_PER_TOKEN
+                # windowed decode reads at most window + qlen keys per row
+                tok = ctx if window is None else min(window + qlen, ctx)
+                bytes_ = bs * tok * BYTES_PER_TOKEN
+                bytes_a = bytes_ * (2 if a_bf16 else 1)
                 sp = ta / tb
                 speedups.append(sp)
                 print(
-                    f"{bs:>3} {ctx:>7} {qlen:>2} {splits:>6} | {ta:>9.1f} {bytes_ / ta / 1e3:>7.0f} {100 * bytes_ / ta / 1e3 / HBM_GBPS:>5.1f} |"
+                    f"{bs:>3} {ctx:>7} {qlen:>2} {splits:>6} | {ta:>9.1f} {bytes_a / ta / 1e3:>7.0f} {100 * bytes_a / ta / 1e3 / HBM_GBPS:>5.1f} |"
                     f" {tb:>9.1f} {bytes_ / tb / 1e3:>7.0f} {100 * bytes_ / tb / 1e3 / HBM_GBPS:>5.1f} | {sp:>7.3f} |"
                     f" {pct(a, .1):>6.0f}-{pct(a, .9):<6.0f} {pct(b, .1):>6.0f}-{pct(b, .9):<6.0f}",
                     flush=True,
                 )
-                del kw
+                del kw, kw_a
                 torch.cuda.empty_cache()
     if speedups:
         gm = math.exp(sum(math.log(s) for s in speedups) / len(speedups))
