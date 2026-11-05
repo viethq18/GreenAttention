@@ -158,6 +158,34 @@ GreenAttention runs their prefill/extend natively on the FP8 cache (`attn_decode
   Limiter: L2 -> SM gather bandwidth (about 2.3 us of K/V loads vs 1.7 us of tensor time per 128-token tile, from
   the byte / FLOP model). ncu is not available on the test host (`ERR_NVGPUCTRPERM`), so this is not measured.
 
+## Sliding-layer fp8 prefill: FA3 route
+
+The 50 sliding layers (head_dim 256, kv 16, q 32, window `(1023, 0)`) prefill on FA4's native fp8 kernel;
+green does not touch them. The fork's `SGLANG_FA4_SM90_FP8_PREFILL_VIA_FA3=1`
+(`flashattention_backend._route_fp8_prefill_to_fa3`) sends E4M3 calls with head_dim <= 256 and
+`max_seqlen_q >= 64` to FA3's fp8 kernel. It wraps FA4's `flash_attn_with_kvcache` inside
+`_init_flash_attention_functions`, below `dispatch.with_kvcache`: the HD512 paths (bf16 query or wide KV) never
+match it, and decode/verify calls green declines have `max_seqlen_q < 64` and stay on FA4.
+
+H100 microbench (`bench/bench_fa3_sliding_prefill.py`) through the fork's own wrapper with `forward_extend`'s
+keyword set, ABBA x 6, min (p25 within 1%), page size 1 (page 16 is within 2%). The GPU was shared with a
+running vLLM, so absolute times are inflated and only the ratios count:
+
+| q tokens x seqs, prefix | FA4 fp8 us | via FA3 us | speedup | relerr vs FA4 |
+|---|---|---|---|---|
+| 64 x 1, 0 | 57.4 | 13.6 | 4.23x | 0.0000 |
+| 512 x 1, 0 | 68.7 | 20.0 | 3.43x | 0.0035 |
+| 2048 x 1, 0 | 202.4 | 188.9 | 1.07x | 0.0005 |
+| 8192 x 1, 0 | 992.3 | 819.3 | 1.21x | 0.0007 |
+| 8192 x 1, 16k | 1024.3 | 960.9 | 1.07x | 0.0007 |
+| 2048 x 1, 30k | 289.2 | 216.1 | 1.34x | 0.0022 |
+| 1024 x 8, 0-20k | 823.1 | 650.5 | 1.27x | 0.0014 |
+| 256 x 32, 0-22k | 1151.3 | 843.9 | 1.36x | 0.0021 |
+
+The short-call gain is mostly FA4's host launch cost (~55 us per call against ~14 us); it counts on eager
+prefill forwards that are host bound. Not measured end to end (no GPU memory for a Gemma server while the
+microbench ran). GreenOptimizer's `configs/launch-gemma4.yaml` sets the env in `green_env`.
+
 ## HD512 fp8 KV calls green declines (`wide_kv.py`)
 
 FA4's bf16 kernel does run HD512, so the `green` backend handles the calls its kernels decline itself:
